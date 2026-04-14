@@ -99,6 +99,25 @@ MAX_ROLLOUT_FILE_SIZE_BYTES = 350 * 1024 * 1024  # 350 MB
 # Soft check threshold for stochastic failures.
 STOCHASTIC_CHECK_FAILURE_THRESHOLD = 0.51
 
+# ────────────────  CONTINUOUS VALIDATION  ────────────────
+
+# How often the validator polls S3 for new miner files (seconds).
+POLL_INTERVAL_SECONDS = 10
+
+# Fraction of a miner's rollouts to verify (the rest are extrapolated).
+ROLLOUT_SAMPLE_RATE = 0.10
+
+# Minimum rollouts to verify per miner regardless of sample rate.
+ROLLOUT_SAMPLE_MIN = 16
+
+# Verification batch size — rollouts are checked in batches of this size.
+# After each batch, the failure rate is evaluated for early gating.
+VERIFICATION_BATCH_SIZE = 16
+
+# If more than this fraction of checked rollouts fail within a batch,
+# the miner is gated immediately and remaining rollouts are skipped.
+BATCH_FAILURE_THRESHOLD = 0.30
+
 # ────────────────  WEIGHT SUBMISSION  ────────────────
 
 WEIGHT_SUBMISSION_INTERVAL = 360  # Blocks between weight submissions
