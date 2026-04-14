@@ -20,7 +20,6 @@ from grail.constants import (
 )
 from grail.infrastructure import chain, storage
 from grail.infrastructure.drand import get_beacon
-from grail.validator.copycat import detect_index_copycats
 from grail.validator.verifier import verify_rollout
 from grail.validator.weights import compute_weights
 
@@ -46,11 +45,16 @@ class ValidationService:
         )
         self._windows_in_interval: int = 0
 
+        # Global index dedup: {dataset_index: hotkey} — loaded from S3 at startup
+        self._used_indices: dict[int, str] = {}
+
     async def run(self, subtensor):
         """Main validation loop — poll continuously."""
+        # Load persisted state from S3
+        self._used_indices = await storage.load_used_indices()
         logger.info(
-            "Starting validation service (netuid=%d, use_drand=%s, poll=%ds)",
-            self.netuid, self.use_drand, POLL_INTERVAL_SECONDS,
+            "Starting validation service (netuid=%d, poll=%ds, %d used indices loaded)",
+            self.netuid, POLL_INTERVAL_SECONDS, len(self._used_indices),
         )
 
         while True:
@@ -114,84 +118,50 @@ class ValidationService:
             len(selected), len(active_hotkeys),
         )
 
-        # Process each miner independently as their file becomes available
-        miner_valid_indices: dict[str, set[int]] = {}
-        miner_upload_times: dict[str, float | None] = {}
-        miner_totals: dict[str, int] = {}
-
+        # Process each miner as their file becomes available
+        window_results: dict[str, dict] = {}
         pending = set(selected)
         attempts = 0
         max_attempts = 30  # ~5 minutes at 10s poll
 
         while pending and attempts < max_attempts:
-            # Try all pending miners in parallel
-            tasks = {
-                hotkey: storage.download_window_rollouts(hotkey, target_window)
-                for hotkey in pending
-            }
-            results = {}
-            for hotkey, coro in tasks.items():
-                results[hotkey] = await coro
-
-            found_this_round = set()
-            for hotkey, (rollouts, upload_time) in results.items():
+            for hotkey in list(pending):
+                rollouts, upload_time = await storage.download_window_rollouts(
+                    hotkey, target_window
+                )
                 if rollouts is None:
                     continue
 
-                found_this_round.add(hotkey)
+                pending.discard(hotkey)
 
-                valid_indices, total = await self._verify_miner(
+                new_indices, total = await self._verify_miner(
                     hotkey, rollouts, randomness, rng,
                 )
 
-                miner_valid_indices[hotkey] = valid_indices
-                miner_upload_times[hotkey] = upload_time
-                miner_totals[hotkey] = total
+                # Record results
+                window_results[hotkey] = {
+                    "unique": len(new_indices),
+                    "total": total,
+                    "indices": list(new_indices),
+                }
 
-            pending -= found_this_round
+                self._miner_metrics[hotkey]["valid"] += len(new_indices)
+                self._miner_metrics[hotkey]["unique"] += len(new_indices)
+                self._miner_metrics[hotkey]["total"] += total
 
             if pending:
-                logger.debug(
-                    "%d miners still pending, polling in %ds",
-                    len(pending), POLL_INTERVAL_SECONDS,
-                )
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 attempts += 1
 
         if pending:
             logger.info(
-                "%d miners never uploaded for window %d: %s",
+                "%d miners never uploaded for window %d",
                 len(pending), target_window,
-                [hk[:8] for hk in pending],
             )
 
-        # Cross-miner copycat detection
-        copycat_submissions = {
-            hotkey: {
-                "indices": miner_valid_indices.get(hotkey, set()),
-                "upload_time": miner_upload_times.get(hotkey),
-            }
-            for hotkey in miner_valid_indices
-        }
-        rejected_indices = detect_index_copycats(copycat_submissions)
-
-        # Score each miner
-        for hotkey in miner_valid_indices:
-            valid_indices = miner_valid_indices[hotkey]
-            rejected = rejected_indices.get(hotkey, set())
-            total = miner_totals.get(hotkey, 0)
-            final_unique = len(valid_indices - rejected)
-
-            if rejected:
-                logger.warning(
-                    "Miner %s: %d indices rejected by copycat detection",
-                    hotkey[:8], len(rejected),
-                )
-
-            self._miner_metrics[hotkey]["valid"] += final_unique
-            self._miner_metrics[hotkey]["unique"] += final_unique
-            self._miner_metrics[hotkey]["checked"] += len(valid_indices)
-            self._miner_metrics[hotkey]["total"] += total
+        # Persist state after each window
+        await storage.save_used_indices(self._used_indices)
+        await storage.save_window_results(target_window, window_results)
 
     async def _verify_miner(
         self,
@@ -203,15 +173,16 @@ class ValidationService:
         """Verify a miner's rollouts with sampling and early gating.
 
         1. Deduplicate rollouts by dataset_index (first occurrence wins).
-        2. Sample ROLLOUT_SAMPLE_RATE of unique rollouts to verify.
-        3. Verify in batches of VERIFICATION_BATCH_SIZE.
-        4. If failure rate exceeds BATCH_FAILURE_THRESHOLD in any batch → gate.
+        2. Reject indices already used globally (by any miner, any window).
+        3. Sample ROLLOUT_SAMPLE_RATE of remaining rollouts to verify.
+        4. Verify in batches of VERIFICATION_BATCH_SIZE.
+        5. If failure rate exceeds BATCH_FAILURE_THRESHOLD in any batch → gate.
 
         Returns:
-            (valid_indices, total_unique_submitted)
-            If gated, valid_indices is empty.
+            (new_valid_indices, total_unique_submitted)
+            If gated, new_valid_indices is empty.
         """
-        # Deduplicate by dataset_index — keep first occurrence only
+        # Deduplicate by dataset_index within this submission
         seen_indices: set[int] = set()
         unique_rollouts: list[dict] = []
         for rollout in rollouts:
@@ -228,17 +199,36 @@ class ValidationService:
             logger.info("Miner %s: no rollouts with dataset_index", hotkey[:8])
             return set(), 0
 
-        # Sample which rollouts to verify
-        sample_size = max(ROLLOUT_SAMPLE_MIN, int(total_unique * ROLLOUT_SAMPLE_RATE))
-        sample_size = min(sample_size, total_unique)
+        # Filter out indices already used globally
+        fresh_rollouts = []
+        already_used = 0
+        for rollout in unique_rollouts:
+            idx = rollout["dataset_index"]
+            if idx in self._used_indices:
+                already_used += 1
+            else:
+                fresh_rollouts.append(rollout)
 
-        sample_indices = rng.sample(range(total_unique), sample_size)
-        to_verify = [unique_rollouts[i] for i in sample_indices]
+        if already_used > 0:
+            logger.info(
+                "Miner %s: %d/%d indices already used globally, %d fresh",
+                hotkey[:8], already_used, total_unique, len(fresh_rollouts),
+            )
+
+        if not fresh_rollouts:
+            return set(), total_unique
+
+        # Sample which rollouts to verify
+        sample_size = max(ROLLOUT_SAMPLE_MIN, int(len(fresh_rollouts) * ROLLOUT_SAMPLE_RATE))
+        sample_size = min(sample_size, len(fresh_rollouts))
+
+        sample_indices = rng.sample(range(len(fresh_rollouts)), sample_size)
+        to_verify = [fresh_rollouts[i] for i in sample_indices]
 
         logger.info(
-            "Miner %s: %d unique rollouts, verifying %d (%.0f%%)",
-            hotkey[:8], total_unique, sample_size,
-            100 * sample_size / total_unique,
+            "Miner %s: %d fresh rollouts, verifying %d (%.0f%%)",
+            hotkey[:8], len(fresh_rollouts), sample_size,
+            100 * sample_size / len(fresh_rollouts),
         )
 
         # Verify in batches with early gating
@@ -265,7 +255,6 @@ class ValidationService:
                         "Miner %s rollout failed: %s", hotkey[:8], reason
                     )
 
-            # Check failure rate for this batch
             batch_size = len(batch)
             if batch_size > 0 and batch_failures / batch_size > BATCH_FAILURE_THRESHOLD:
                 logger.warning(
@@ -283,12 +272,19 @@ class ValidationService:
         if gated:
             return set(), total_unique
 
-        # Extrapolate: if sampled rollouts pass, credit all unique indices
+        # All batches passed — credit all fresh indices
+        new_indices = set()
+        for rollout in fresh_rollouts:
+            idx = rollout["dataset_index"]
+            new_indices.add(idx)
+            self._used_indices[idx] = hotkey
+
         logger.info(
-            "Miner %s: %d/%d verified passed — crediting %d unique indices",
-            hotkey[:8], verified_valid, verified_total, total_unique,
+            "Miner %s: %d/%d verified passed — crediting %d new indices (%d total used)",
+            hotkey[:8], verified_valid, verified_total,
+            len(new_indices), len(self._used_indices),
         )
-        return seen_indices, total_unique
+        return new_indices, total_unique
 
     async def _submit_weights(self, subtensor):
         """Compute and submit weights on-chain."""

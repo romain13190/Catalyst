@@ -85,6 +85,57 @@ async def file_exists(key: str, **client_kwargs) -> bool:
         return False
 
 
+async def load_used_indices(**client_kwargs) -> dict[int, str]:
+    """Load the global used-indices map from S3.
+
+    Returns:
+        {dataset_index: hotkey} for every index ever credited.
+        Empty dict if file doesn't exist yet.
+    """
+    key = "grail/state/used_indices.json.gz"
+    try:
+        async with get_s3_client(**client_kwargs) as client:
+            bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "grail")
+            resp = await client.get_object(Bucket=bucket, Key=key)
+            body = await resp["Body"].read()
+            body = gzip.decompress(body)
+            raw = json.loads(body)
+            # JSON keys are strings — convert back to int
+            return {int(k): v for k, v in raw.items()}
+    except Exception as e:
+        logger.info("No existing used_indices found (starting fresh): %s", e)
+        return {}
+
+
+async def save_used_indices(used: dict[int, str], **client_kwargs) -> bool:
+    """Save the global used-indices map to S3."""
+    key = "grail/state/used_indices.json.gz"
+    # JSON keys must be strings
+    payload = json.dumps(
+        {str(k): v for k, v in used.items()}, separators=(",", ":")
+    ).encode()
+    compressed = gzip.compress(payload)
+    async with get_s3_client(**client_kwargs) as client:
+        bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "grail")
+        await client.put_object(Bucket=bucket, Key=key, Body=compressed)
+    logger.info("Saved %d used indices (%d bytes)", len(used), len(compressed))
+    return True
+
+
+async def save_window_results(
+    window_start: int, results: dict, **client_kwargs
+) -> bool:
+    """Save validation results for a window to S3."""
+    key = f"grail/results/window-{window_start}.json.gz"
+    payload = json.dumps(results, separators=(",", ":")).encode()
+    compressed = gzip.compress(payload)
+    async with get_s3_client(**client_kwargs) as client:
+        bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "grail")
+        await client.put_object(Bucket=bucket, Key=key, Body=compressed)
+    logger.info("Saved results for window %d (%d bytes)", window_start, len(compressed))
+    return True
+
+
 async def upload_window_rollouts(
     hotkey: str, window_start: int, rollouts: list[dict], **client_kwargs
 ) -> bool:
