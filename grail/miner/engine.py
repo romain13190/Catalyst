@@ -2,14 +2,17 @@
 
 import logging
 import random
+import time
 from typing import Any
 
 import torch
 
 from grail.constants import (
+    BLOCK_TIME_SECONDS,
     CHALLENGE_K,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    WINDOW_LENGTH,
 )
 from grail.infrastructure import chain, storage
 from grail.infrastructure.drand import get_beacon
@@ -20,6 +23,9 @@ from grail.shared.forward import forward_single_layer
 from grail.shared.hf_compat import resolve_hidden_size
 
 logger = logging.getLogger(__name__)
+
+# Leave time at the end of the window for upload.
+_UPLOAD_BUFFER_SECONDS = 30
 
 
 class MiningEngine:
@@ -36,7 +42,6 @@ class MiningEngine:
         vllm_gpu: int = 0,
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
-        rollouts_per_window: int = 64,
     ):
         self.vllm_model = vllm_model
         self.hf_model = hf_model
@@ -45,7 +50,6 @@ class MiningEngine:
         self.dataset = dataset
         self.proof_gpu = proof_gpu
         self.max_new_tokens = max_new_tokens
-        self.rollouts_per_window = rollouts_per_window
         self._dataset_size = len(dataset)
         self._hidden_dim = resolve_hidden_size(hf_model)
         self._verifier = GRAILVerifier(hidden_dim=self._hidden_dim)
@@ -56,7 +60,7 @@ class MiningEngine:
         window_start: int,
         use_drand: bool = True,
     ) -> list[dict]:
-        """Generate rollouts for a window and upload."""
+        """Generate as many rollouts as possible within the window and upload."""
         block_hash = await chain.get_block_hash(subtensor, window_start)
         if use_drand:
             beacon = get_beacon(use_drand=True)
@@ -66,18 +70,26 @@ class MiningEngine:
         else:
             randomness = chain.compute_window_randomness(block_hash)
 
-        # Pick random unique indices from the dataset
-        indices = random.sample(
-            range(self._dataset_size), self.rollouts_per_window
-        )
+        # Deadline: end of window minus upload buffer
+        window_duration = WINDOW_LENGTH * BLOCK_TIME_SECONDS
+        deadline = time.monotonic() + window_duration - _UPLOAD_BUFFER_SECONDS
 
         logger.info(
-            "Mining window %d with %d indices", window_start, len(indices)
+            "Mining window %d — generating until deadline (%.0fs budget)",
+            window_start, window_duration - _UPLOAD_BUFFER_SECONDS,
         )
 
         all_rollouts = []
+        used_indices: set[int] = set()
+        nonce = 0
 
-        for nonce, dataset_index in enumerate(indices):
+        while time.monotonic() < deadline:
+            # Pick a random index not yet used this window
+            dataset_index = random.randrange(self._dataset_size)
+            if dataset_index in used_indices:
+                continue
+            used_indices.add(dataset_index)
+
             try:
                 row = self.dataset[dataset_index]
                 prompt_text = row.get("text", "")
@@ -89,6 +101,7 @@ class MiningEngine:
                     nonce, dataset_index,
                 )
                 all_rollouts.append(rollout)
+                nonce += 1
             except Exception as e:
                 logger.error("Rollout generation failed for index %d: %s", dataset_index, e)
 
@@ -98,8 +111,9 @@ class MiningEngine:
                 hotkey, window_start, all_rollouts
             )
             logger.info(
-                "Uploaded %d rollouts for window %d",
+                "Uploaded %d rollouts for window %d (%.1fs)",
                 len(all_rollouts), window_start,
+                time.monotonic() - (deadline - window_duration + _UPLOAD_BUFFER_SECONDS),
             )
 
         return all_rollouts
