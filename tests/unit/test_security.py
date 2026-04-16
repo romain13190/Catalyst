@@ -215,30 +215,13 @@ class TestMinimumChallengesEnforced:
 # ══════════════════════════════════════════════════════════════════════
 
 
-class TestPromptVerificationMandatory:
-    """Attack: miner uses crafted prompts. Without dataset, check was skipped.
-    Fix: dataset=None → immediate reject("no_dataset").
-    """
-
-    def test_no_dataset_rejects(self):
-        from grail.validator.verifier import verify_rollout
-
-        rollout = {"commit": {}, "dataset_index": 0, "nonce": 1}
-        ok, reason = verify_rollout(
-            rollout, "hk", MagicMock(), MagicMock(), "aabb", set(), dataset=None
-        )
-        assert not ok
-        assert reason == "no_dataset"
-
-    def test_no_further_checks_when_no_dataset(self):
-        from grail.validator.verifier import verify_rollout
-
-        with patch("grail.protocol.signatures.verify_commit_signature") as mock_sig:
-            verify_rollout(
-                {"commit": {}, "nonce": 1}, "hk", MagicMock(),
-                MagicMock(), "aabb", set(), dataset=None,
-            )
-            mock_sig.assert_not_called()
+# ══════════════════════════════════════════════════════════════════════
+# Note: prompt verification moved into the WindowBatcher in the GRPO
+# refactor. The validator now derives prompts deterministically from the
+# beacon, so the "miner uses a crafted prompt" attack surface is gone —
+# the slot's expected prompt is owned by the validator, not declared by
+# the miner. See tests/unit/test_batcher.py::test_invalid_prompt_rejected.
+# ══════════════════════════════════════════════════════════════════════
 
 
 # ══════════════════════════════════════════════════════════════════════

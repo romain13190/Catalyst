@@ -1,4 +1,9 @@
-"""GRAIL proof verification — hard checks + soft checks."""
+"""GRAIL proof verification — primitives used by the WindowBatcher.
+
+The orchestration (which prompt, which slot, which miner) lives in
+`grail.validator.batcher`. This module only exposes the per-commit
+checks that touch the model or the signature scheme.
+"""
 
 import logging
 from typing import Any
@@ -9,39 +14,8 @@ from grail.constants import (
     LAYER_INDEX,
     MAX_TOKENS_PER_ROLLOUT,
 )
-from grail.dataset.loader import get_prompt_by_index
 
 logger = logging.getLogger(__name__)
-
-
-def verify_prompt(rollout: dict, dataset: Any, tokenizer: Any) -> bool:
-    """Hard check: rollout tokens start with the correct prompt from the dataset.
-
-    The miner declares a dataset_index. We look up that index, tokenize the
-    text, and compare against the first prompt_length tokens of the rollout.
-    """
-    dataset_index = rollout.get("dataset_index")
-    if dataset_index is None or dataset_index < 0:
-        return False
-
-    text = get_prompt_by_index(dataset, dataset_index)
-    if text is None:
-        return False
-
-    commit = rollout.get("commit", {})
-    tokens = commit.get("tokens", [])
-    prompt_length = commit.get("rollout", {}).get("prompt_length", 0)
-
-    expected_tokens = tokenizer.encode(text, add_special_tokens=False)
-
-    if len(expected_tokens) != prompt_length:
-        return False
-    if len(tokens) < prompt_length:
-        return False
-    if tokens[:prompt_length] != expected_tokens:
-        return False
-
-    return True
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -54,14 +28,6 @@ def verify_signature(commit: dict, hotkey: str) -> bool:
 def verify_proof_version(commit: dict) -> bool:
     """Hard check: proof version must match protocol."""
     return commit.get("proof_version") == GRAIL_PROOF_VERSION
-
-
-def verify_nonce_unique(nonce: int, seen_nonces: set[int]) -> bool:
-    """Hard check: nonce must not be reused within a window."""
-    if nonce in seen_nonces:
-        return False
-    seen_nonces.add(nonce)
-    return True
 
 
 def verify_commitment_proofs(
@@ -141,42 +107,3 @@ def verify_commitment_proofs(
     # A miner cannot benefit from having fewer positions verified.
     all_passed = passed == checked and checked >= expected_challenges
     return all_passed, passed, checked
-
-
-def verify_rollout(
-    rollout: dict,
-    hotkey: str,
-    model: Any,
-    tokenizer: Any,
-    window_randomness: str,
-    seen_nonces: set[int],
-    dataset: Any = None,
-) -> tuple[bool, str]:
-    """Run all hard checks on a rollout."""
-    # Prompt check — must verify that the miner used the correct dataset prompt.
-    # Without this, a miner can use arbitrary prompts optimized for forgery.
-    if dataset is None:
-        logger.warning("Dataset not provided — cannot verify prompt origin")
-        return False, "no_dataset"
-    if not verify_prompt(rollout, dataset, tokenizer):
-        return False, "invalid_prompt"
-
-    commit = rollout.get("commit", {})
-
-    if not verify_signature(commit, hotkey):
-        return False, "invalid_signature"
-
-    if not verify_proof_version(commit):
-        return False, "invalid_proof_version"
-
-    nonce = rollout.get("nonce", -1)
-    if not verify_nonce_unique(nonce, seen_nonces):
-        return False, "duplicate_nonce"
-
-    all_passed, passed, checked = verify_commitment_proofs(
-        commit, model, window_randomness
-    )
-    if not all_passed:
-        return False, f"proof_failed ({passed}/{checked})"
-
-    return True, "ok"
