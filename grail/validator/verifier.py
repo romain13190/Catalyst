@@ -7,6 +7,7 @@ from grail.constants import (
     CHALLENGE_K,
     GRAIL_PROOF_VERSION,
     LAYER_INDEX,
+    MAX_TOKENS_PER_ROLLOUT,
 )
 from grail.dataset.loader import get_prompt_by_index
 
@@ -82,16 +83,38 @@ def verify_commitment_proofs(
 
     tokens = commit["tokens"]
     commitments = commit["commitments"]
-    beacon = commit.get("beacon", {})
-    randomness = beacon.get("randomness", window_randomness)
+
+    # SECURITY: Miner must provide exactly one commitment per token.
+    # Otherwise they can omit commitments for positions they can't forge,
+    # and the verifier would silently skip those challenges.
+    seq_len = len(tokens)
+    if len(commitments) != seq_len:
+        logger.warning(
+            "Commitment count mismatch: %d commitments for %d tokens",
+            len(commitments), seq_len,
+        )
+        return False, 0, 0
+
+    # SECURITY: Reject sequences that would cause GPU OOM.
+    if seq_len > MAX_TOKENS_PER_ROLLOUT:
+        logger.warning(
+            "Token sequence too long: %d tokens (max %d)",
+            seq_len, MAX_TOKENS_PER_ROLLOUT,
+        )
+        return False, 0, 0
+
+    # SECURITY: Always use the validator's independently-computed randomness.
+    # Never trust the miner's claimed beacon — a miner who controls the
+    # randomness can predict which positions are challenged and only forge those.
+    randomness = window_randomness
 
     hidden_dim = resolve_hidden_size(model)
     verifier = GRAILVerifier(hidden_dim=hidden_dim)
     r_vec = verifier.generate_r_vec(randomness)
 
-    seq_len = len(tokens)
+    expected_challenges = min(CHALLENGE_K, seq_len)
     challenge_indices = indices_from_root(
-        tokens, randomness, seq_len, min(CHALLENGE_K, seq_len)
+        tokens, randomness, seq_len, expected_challenges
     )
 
     input_ids = torch.tensor([tokens], device=next(model.parameters()).device)
@@ -103,7 +126,7 @@ def verify_commitment_proofs(
     passed = 0
     checked = 0
     for idx in challenge_indices:
-        if idx >= len(commitments):
+        if idx >= seq_len:
             continue
         checked += 1
         miner_commit = commitments[idx]
@@ -114,7 +137,9 @@ def verify_commitment_proofs(
         if valid:
             passed += 1
 
-    all_passed = passed == checked and checked > 0
+    # SECURITY: All expected challenge positions must be checked and pass.
+    # A miner cannot benefit from having fewer positions verified.
+    all_passed = passed == checked and checked >= expected_challenges
     return all_passed, passed, checked
 
 
@@ -128,10 +153,13 @@ def verify_rollout(
     dataset: Any = None,
 ) -> tuple[bool, str]:
     """Run all hard checks on a rollout."""
-    # Prompt check (requires dataset)
-    if dataset is not None:
-        if not verify_prompt(rollout, dataset, tokenizer):
-            return False, "invalid_prompt"
+    # Prompt check — must verify that the miner used the correct dataset prompt.
+    # Without this, a miner can use arbitrary prompts optimized for forgery.
+    if dataset is None:
+        logger.warning("Dataset not provided — cannot verify prompt origin")
+        return False, "no_dataset"
+    if not verify_prompt(rollout, dataset, tokenizer):
+        return False, "invalid_prompt"
 
     commit = rollout.get("commit", {})
 

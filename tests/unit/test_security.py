@@ -492,3 +492,39 @@ class TestProofVersionConsistency:
             "model": {"name": "test", "layer_index": -1},
         }
         assert verify_commit_signature(commit, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY") is False
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FAILLE #8 — Token sequence length check
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestTokenSequenceLengthCheck:
+    """Rollouts with excessively long token sequences must be rejected
+    before the forward pass to prevent GPU OOM."""
+
+    def test_rejects_oversized_sequence(self):
+        from grail.validator.verifier import verify_commitment_proofs
+        from grail.constants import MAX_TOKENS_PER_ROLLOUT
+
+        tokens = list(range(MAX_TOKENS_PER_ROLLOUT + 1))
+        commit = {"tokens": tokens, "commitments": [{"sketch": 0}] * len(tokens)}
+        result, passed, checked = verify_commitment_proofs(
+            commit, _make_mock_model(), "aabb"
+        )
+        assert result is False
+        assert checked == 0
+
+    def test_accepts_valid_length(self):
+        from grail.validator.verifier import verify_commitment_proofs
+
+        seq_len = 64
+        commit = {"tokens": list(range(seq_len)), "commitments": [{"sketch": 0}] * seq_len}
+        # Will fail on proof verification but should not short-circuit on length
+        with patch("grail.shared.forward.forward_single_layer",
+                   return_value=(torch.randn(1, seq_len, HIDDEN_DIM), None)), \
+             patch("grail.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM):
+            result, passed, checked = verify_commitment_proofs(
+                commit, _make_mock_model(), "aabb"
+            )
+            assert checked > 0  # Got past the length check
