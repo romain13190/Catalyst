@@ -1,31 +1,39 @@
-"""Miner engine — vLLM generation + HuggingFace proof construction."""
+"""Miner engine — vLLM generation + HuggingFace GRAIL proof construction.
+
+Protocol: deterministic prompts derived from beacon randomness → 4
+prefix-distinct completions per slot → HTTP submission to validator.
+"""
+
+from __future__ import annotations
 
 import logging
-import random
 import time
-from typing import Any
-
-import torch
+from typing import TYPE_CHECKING
 
 from grail.constants import (
     BLOCK_TIME_SECONDS,
-    CHALLENGE_K,
+    COMPLETIONS_PER_SUBMISSION,
+    DIVERSITY_PREFIX_LEN,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    PROMPTS_PER_WINDOW,
+    UPLOAD_BUFFER,
     WINDOW_LENGTH,
 )
-from grail.infrastructure import chain, storage
-from grail.infrastructure.drand import get_beacon
-from grail.protocol.crypto import create_proof
-from grail.protocol.grail_verifier import GRAILVerifier
-from grail.protocol.signatures import sign_commit_binding
-from grail.shared.forward import forward_single_layer
-from grail.shared.hf_compat import resolve_hidden_size
+from grail.infrastructure import chain
+from grail.miner.prompts import derive_window_prompts
+from grail.miner.submitter import (
+    SubmissionError,
+    discover_validator_url,
+    get_window_state,
+    submit_batch,
+)
+from grail.protocol.submission import CompletionSubmission, SubmissionRequest
+
+if TYPE_CHECKING:
+    from grail.environment.base import Environment
 
 logger = logging.getLogger(__name__)
-
-# Leave time at the end of the window for upload.
-_UPLOAD_BUFFER_SECONDS = 30
 
 
 class MiningEngine:
@@ -37,116 +45,239 @@ class MiningEngine:
         hf_model,
         tokenizer,
         wallet,
-        dataset,
+        env: "Environment",
         *,
         vllm_gpu: int = 0,
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
-    ):
+        validator_url_override: str | None = None,
+    ) -> None:
         self.vllm_model = vllm_model
         self.hf_model = hf_model
         self.tokenizer = tokenizer
         self.wallet = wallet
-        self.dataset = dataset
+        self.env = env
+        self.vllm_gpu = vllm_gpu
         self.proof_gpu = proof_gpu
         self.max_new_tokens = max_new_tokens
-        self._dataset_size = len(dataset)
+        self.validator_url_override = validator_url_override
+
+        # Lazy imports for heavy deps — keep module import cheap.
+        from grail.shared.hf_compat import resolve_hidden_size
+        from grail.protocol.grail_verifier import GRAILVerifier
+
         self._hidden_dim = resolve_hidden_size(hf_model)
         self._verifier = GRAILVerifier(hidden_dim=self._hidden_dim)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     async def mine_window(
         self,
         subtensor,
         window_start: int,
         use_drand: bool = True,
-    ) -> list[dict]:
-        """Generate as many rollouts as possible within the window and upload."""
+    ) -> list:
+        """Iterate over 8 deterministic prompts and submit 4 completions per slot.
+
+        Returns the list of SubmissionResponse objects collected during the
+        window.
+        """
+        import httpx
+
+        # 1. Compute window randomness
+        randomness = await self._compute_randomness(subtensor, window_start, use_drand)
+
+        # 2. Derive 8 deterministic prompts
+        problems = derive_window_prompts(self.env, randomness, PROMPTS_PER_WINDOW)
+
+        # 3. Resolve validator URL
+        if self.validator_url_override:
+            url = self.validator_url_override
+        else:
+            metagraph = await chain.get_metagraph(subtensor, chain.NETUID)
+            url = discover_validator_url(metagraph)
+
+        # 4. Deadline: end of window minus upload buffer
+        deadline = (
+            time.monotonic()
+            + WINDOW_LENGTH * BLOCK_TIME_SECONDS
+            - UPLOAD_BUFFER
+        )
+        logger.info(
+            "Mining window %d — %.0fs budget, validator %s",
+            window_start,
+            WINDOW_LENGTH * BLOCK_TIME_SECONDS - UPLOAD_BUFFER,
+            url,
+        )
+
+        results = []
+
+        # 5. Shared HTTP client for all submissions this window
+        async with httpx.AsyncClient(timeout=30) as client:
+            for slot_index, problem in enumerate(problems):
+                # 6a. Check deadline before each slot
+                if time.monotonic() >= deadline:
+                    logger.info(
+                        "deadline reached, stopping at slot %d", slot_index
+                    )
+                    break
+
+                # 6b. Fetch window state to skip already-settled slots
+                try:
+                    state = await get_window_state(url, window_start, client=client)
+                    slot_state = next(
+                        (s for s in state.slot_states if s.slot_index == slot_index),
+                        None,
+                    )
+                    if slot_state is not None and slot_state.settled:
+                        logger.debug("slot %d already settled, skipping", slot_index)
+                        continue
+                except SubmissionError as exc:
+                    # Window not active yet or racing the validator — attempt anyway.
+                    logger.debug(
+                        "get_window_state for slot %d failed (%s); submitting anyway",
+                        slot_index, exc,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Unexpected error fetching window state for slot %d: %s",
+                        slot_index, exc,
+                    )
+                    continue
+
+                # 6c. Generate 4 prefix-distinct completions
+                diverse = self._generate_diverse_batch(problem, randomness)
+                if len(diverse) < COMPLETIONS_PER_SUBMISSION:
+                    logger.warning(
+                        "slot %d: only got %d distinct-prefix completions after "
+                        "max attempts (need %d) — skipping",
+                        slot_index, len(diverse), COMPLETIONS_PER_SUBMISSION,
+                    )
+                    continue
+
+                # 6d. Build CompletionSubmission objects
+                completions = [
+                    self._build_completion_submission(gen, randomness)
+                    for gen in diverse
+                ]
+
+                # 6e. Build and send SubmissionRequest
+                request = SubmissionRequest(
+                    window_start=window_start,
+                    slot_index=slot_index,
+                    prompt_id=problem["id"],
+                    miner_hotkey=self.wallet.hotkey.ss58_address,
+                    completions=completions,
+                )
+                try:
+                    response = await submit_batch(url, request, client=client)
+                    logger.info(
+                        "slot %d: accepted=%s reason=%r settled=%s slot_count=%d",
+                        slot_index,
+                        response.accepted,
+                        response.reason,
+                        response.settled,
+                        response.slot_count,
+                    )
+                    results.append(response)
+                except SubmissionError as exc:
+                    logger.error("slot %d: submission failed: %s", slot_index, exc)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    async def _compute_randomness(
+        self, subtensor, window_start: int, use_drand: bool
+    ) -> str:
+        """Derive window randomness from block hash (+ optional drand beacon)."""
         block_hash = await chain.get_block_hash(subtensor, window_start)
         if use_drand:
-            from grail.infrastructure.drand import get_current_chain
+            from grail.infrastructure.drand import get_beacon, get_current_chain
 
             chain_info = get_current_chain()
             drand_round = chain.compute_drand_round_for_window(
                 window_start, chain_info["genesis_time"], chain_info["period"]
             )
             beacon = get_beacon(round_id=str(drand_round), use_drand=True)
-            randomness = chain.compute_window_randomness(
+            return chain.compute_window_randomness(
                 block_hash, beacon["randomness"], drand_round=beacon["round"]
             )
-        else:
-            randomness = chain.compute_window_randomness(block_hash)
+        return chain.compute_window_randomness(block_hash)
 
-        # Deadline: end of window minus upload buffer
-        window_duration = WINDOW_LENGTH * BLOCK_TIME_SECONDS
-        deadline = time.monotonic() + window_duration - _UPLOAD_BUFFER_SECONDS
+    def _generate_diverse_batch(self, problem: dict, randomness: str) -> list[dict]:
+        """Generate up to COMPLETIONS_PER_SUBMISSION completions with distinct prefixes.
 
-        logger.info(
-            "Mining window %d — generating until deadline (%.0fs budget)",
-            window_start, window_duration - _UPLOAD_BUFFER_SECONDS,
+        Retries up to 10 times on prefix collision.  Returns however many
+        distinct completions were found (caller skips the slot if < 4).
+        """
+        import torch
+
+        _MAX_ATTEMPTS = 10
+        prompt_tokens: list[int] = self.tokenizer.encode(
+            problem["prompt"], add_special_tokens=False
         )
+        prompt_length = len(prompt_tokens)
 
-        all_rollouts = []
-        used_indices: set[int] = set()
-        nonce = 0
+        seen_prefixes: set[tuple] = set()
+        completions: list[dict] = []
 
-        while time.monotonic() < deadline:
-            # Pick a random index not yet used this window
-            dataset_index = random.randrange(self._dataset_size)
-            if dataset_index in used_indices:
-                continue
-            used_indices.add(dataset_index)
+        for _attempt in range(_MAX_ATTEMPTS):
+            if len(completions) >= COMPLETIONS_PER_SUBMISSION:
+                break
 
-            try:
-                row = self.dataset[dataset_index]
-                prompt_text = row.get("text", "")
-                if not prompt_text:
-                    continue
-
-                rollout = self._generate_and_prove(
-                    prompt_text, randomness, window_start, block_hash,
-                    nonce, dataset_index,
+            with torch.no_grad():
+                input_tensor = torch.tensor(
+                    [prompt_tokens], device=getattr(self.vllm_model, "device", "cpu")
                 )
-                all_rollouts.append(rollout)
-                nonce += 1
-            except Exception as e:
-                logger.error("Rollout generation failed for index %d: %s", dataset_index, e)
+                outputs = self.vllm_model.generate(
+                    input_tensor,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=1.0,
+                )
+            all_tokens: list[int] = outputs[0].tolist()
+            completion_tokens = all_tokens[prompt_length:]
 
-        if all_rollouts:
-            hotkey = self.wallet.hotkey.ss58_address
-            await storage.upload_window_rollouts(
-                hotkey, window_start, all_rollouts
+            prefix = tuple(completion_tokens[:DIVERSITY_PREFIX_LEN])
+            if prefix in seen_prefixes:
+                continue
+            seen_prefixes.add(prefix)
+            completions.append(
+                {
+                    "tokens": all_tokens,
+                    "prompt_length": prompt_length,
+                    "completion_tokens": completion_tokens,
+                }
             )
-            logger.info(
-                "Uploaded %d rollouts for window %d (%.1fs)",
-                len(all_rollouts), window_start,
-                time.monotonic() - (deadline - window_duration + _UPLOAD_BUFFER_SECONDS),
-            )
 
-        return all_rollouts
+        return completions
 
-    def _generate_and_prove(
-        self,
-        prompt: str,
-        randomness: str,
-        window_start: int,
-        block_hash: str,
-        nonce: int,
-        dataset_index: int,
-    ) -> dict:
-        """Generate text with vLLM, construct proof with HF."""
-        # Step 1: Generate with vLLM (GPU 0)
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
-        prompt_length = input_ids.shape[1]
+    def _build_completion_submission(
+        self, generation: dict, randomness: str
+    ) -> CompletionSubmission:
+        """Construct a GRAIL-proven CompletionSubmission from a generation dict.
 
-        with torch.no_grad():
-            outputs = self.vllm_model.generate(
-                input_ids.to(self.vllm_model.device),
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-            )
-        all_tokens = outputs[0].tolist()
+        Reproduces the proof construction from the original _generate_and_prove:
+          - HF forward pass for hidden_states + logits
+          - Commitment batch via GRAILVerifier
+          - log-softmax token log-probs
+          - Signature via sign_commit_binding
+        """
+        import torch
 
-        # Step 2: HF forward pass for proof (GPU 1)
+        from grail.constants import GRAIL_PROOF_VERSION
+        from grail.protocol.signatures import sign_commit_binding
+        from grail.shared.forward import forward_single_layer
+
+        all_tokens: list[int] = generation["tokens"]
+        prompt_length: int = generation["prompt_length"]
+
+        # HF forward pass on proof GPU
         proof_input = torch.tensor(
             [all_tokens], device=f"cuda:{self.proof_gpu}"
         )
@@ -157,29 +288,27 @@ class MiningEngine:
 
         hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
 
-        # Step 3: Build commitments
+        # Build commitments
         r_vec = self._verifier.generate_r_vec(randomness)
         commitments = self._verifier.create_commitments_batch(hidden_states, r_vec)
 
-        # Step 4: Compute logprobs from HF (not vLLM — bit-identical with validator)
+        # Token log-probs from HF (bit-identical with validator)
         log_probs = torch.log_softmax(logits[0], dim=-1)
-        token_logprobs = []
+        token_logprobs: list[float] = []
         for i in range(prompt_length, len(all_tokens)):
             token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
 
-        # Step 5: Create proof and sign
-        model_name = getattr(self.hf_model, "name_or_path", "unknown")
-
+        # Sign
+        model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
         signature = sign_commit_binding(
             all_tokens, randomness, model_name, LAYER_INDEX,
             commitments, self.wallet,
         )
 
-        # Step 6: Package rollout
         commit = {
             "tokens": all_tokens,
             "commitments": commitments,
-            "proof_version": "v5",
+            "proof_version": GRAIL_PROOF_VERSION,
             "model": {"name": model_name, "layer_index": LAYER_INDEX},
             "signature": signature.hex(),
             "beacon": {"randomness": randomness},
@@ -193,11 +322,4 @@ class MiningEngine:
             },
         }
 
-        return {
-            "window_start": window_start,
-            "dataset_index": dataset_index,
-            "nonce": nonce,
-            "block_hash": block_hash,
-            "hotkey": self.wallet.hotkey.ss58_address,
-            "commit": commit,
-        }
+        return CompletionSubmission(tokens=all_tokens, commit=commit)
