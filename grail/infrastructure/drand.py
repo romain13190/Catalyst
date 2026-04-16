@@ -83,6 +83,91 @@ _CHAIN_INFO_CACHE: dict[str, dict[str, Any]] = {}
 _LOCK = Lock()
 _BEACON_COUNTER = 0
 
+# ─────────────────────────  BEACON SIGNATURE VERIFICATION  ──────────────────
+
+# Cached public keys per chain hash (fetched once from /info).
+_CHAIN_PUBKEYS: dict[str, bytes] = {}
+
+
+def _fetch_chain_pubkey(chain_hash: str) -> bytes | None:
+    """Fetch and cache the BLS public key for a drand chain."""
+    if chain_hash in _CHAIN_PUBKEYS:
+        return _CHAIN_PUBKEYS[chain_hash]
+
+    info = _fetch_chain_info(chain_hash)
+    if not info:
+        return None
+
+    pubkey_hex = info.get("public_key") or info.get("publicKey")
+    if not pubkey_hex:
+        logger.warning("[Drand] chain info has no public_key field")
+        return None
+
+    try:
+        pubkey_bytes = bytes.fromhex(pubkey_hex)
+        _CHAIN_PUBKEYS[chain_hash] = pubkey_bytes
+        return pubkey_bytes
+    except ValueError:
+        logger.warning("[Drand] invalid public key hex: %s", pubkey_hex[:40])
+        return None
+
+
+def verify_beacon_signature(
+    chain_hash: str,
+    round_number: int,
+    randomness_hex: str,
+    signature_hex: str | None,
+) -> bool:
+    """Verify a drand beacon's BLS signature.
+
+    For unchained schemes (quicknet): message = SHA256(round_be8).
+    The signature is a BLS sig on G1 over the message, verified with the
+    chain's public key on G2.
+
+    Returns True if the signature is valid, False otherwise.
+    """
+    if not signature_hex:
+        logger.warning("[Drand] beacon has no signature — cannot verify")
+        return False
+
+    pubkey = _fetch_chain_pubkey(chain_hash)
+    if not pubkey:
+        logger.warning("[Drand] no public key available for chain %s", chain_hash[:16])
+        return False
+
+    try:
+        import hashlib as _hl
+        import struct as _st
+
+        round_bytes = _st.pack(">Q", round_number)
+        message = _hl.sha256(round_bytes).digest()
+
+        sig_bytes = bytes.fromhex(signature_hex)
+
+        # Try blst (fast C library) — the only supported verification path.
+        try:
+            from blst import P1_Affine, P2_Affine  # type: ignore[import-untyped]
+
+            sig = P1_Affine(sig_bytes)
+            pk = P2_Affine(pubkey)
+            # DST for drand quicknet (BLS12-381 G1, RFC 9380)
+            dst = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_"
+            result = sig.core_verify(pk, True, message, dst)
+            return result == 0  # BLST_SUCCESS
+        except ImportError:
+            # SECURITY: No BLS library available — fail closed.
+            # A hash-based fallback would be trivially forgeable.
+            logger.error(
+                "[Drand] No BLS library (blst) installed — cannot verify beacon. "
+                "Install blst: pip install blst"
+            )
+            return False
+
+    except Exception as e:
+        logger.warning("[Drand] beacon signature verification failed: %s", e)
+        return False
+
+
 # ───────────────────────────────  UTILITIES  ────────────────────────────────
 
 
@@ -263,7 +348,7 @@ def get_current_chain() -> dict[str, Any]:
     return rec
 
 
-def get_drand_beacon(round_id: int | None = None, use_fallback: bool = True) -> dict[str, Any]:
+def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) -> dict[str, Any]:
     """
     Fetch randomness from the drand network (v2-first, v1 fallback).
 
@@ -304,7 +389,16 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = True) -> 
             return get_mock_beacon()
         raise RuntimeError("drand response missing required fields")
 
-    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={str(rnd)[:8]}...")
+    # SECURITY: Verify the beacon's cryptographic signature before trusting it.
+    # Without this, a MITM or compromised relay can inject fake randomness.
+    sig = data.get("signature")
+    if not verify_beacon_signature(_DRAND_CHAIN_HASH, int(rno), str(rnd), sig):
+        logger.error(
+            "[Drand] Beacon signature verification FAILED for round %s — rejecting", rno
+        )
+        raise RuntimeError(f"drand beacon signature invalid for round {rno}")
+
+    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={str(rnd)[:8]}... (sig verified)")
     return {
         "source": "drand",
         "chain": _current_chain,
@@ -312,7 +406,7 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = True) -> 
         "period": _DRAND_PERIOD,
         "round": int(rno),
         "randomness": str(rnd),
-        "signature": data.get("signature"),
+        "signature": sig,
         "previous_signature": data.get("previous_signature"),
     }
 
@@ -341,13 +435,13 @@ def get_mock_beacon() -> dict[str, Any]:
 
 
 def get_beacon(
-    round_id: str = "latest", use_drand: bool = True, use_fallback: bool = True
+    round_id: str = "latest", use_drand: bool = True, use_fallback: bool = False
 ) -> dict[str, Any]:
     """
     Convenience wrapper:
       - round_id: "latest" or round number as string/int
-      - use_drand=False forces mock
-      - use_fallback=False raises on network errors (useful in tests)
+      - use_drand=False forces mock (testing only)
+      - use_fallback=False (default) raises on network errors
     """
     if not use_drand:
         return get_mock_beacon()
