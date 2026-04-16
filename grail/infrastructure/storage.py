@@ -194,9 +194,25 @@ async def upload_window_rollouts(
     return True
 
 
-async def upload_window_dataset(window_start: int, data: dict, **kwargs) -> bool:
-    """STUB — replaced by the Task 9 implementation."""
-    logger.info("upload_window_dataset stub: window=%d, slots=%d", window_start, len(data.get("slots", [])))
+async def upload_window_dataset(
+    window_start: int, data: dict, **client_kwargs
+) -> bool:
+    """Upload the settled GRPO dataset (prompt + 32 completions + rewards) for a window.
+
+    The output of this is the actual deliverable of the network: a stream of
+    {prompt, completions, rewards} bundles ready to feed a training pipeline.
+    Stored under `grail/dataset/window-{n}.json.gz`.
+    """
+    key = f"grail/dataset/window-{window_start}.json.gz"
+    payload = json.dumps(data, separators=(",", ":")).encode()
+    compressed = gzip.compress(payload)
+    async with get_s3_client(**client_kwargs) as client:
+        bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "grail")
+        await client.put_object(Bucket=bucket, Key=key, Body=compressed)
+    logger.info(
+        "Uploaded GRPO dataset for window %d (%d slots, %d bytes)",
+        window_start, len(data.get("slots", [])), len(compressed),
+    )
     return True
 
 

@@ -6,6 +6,8 @@ import os
 
 import typer
 
+from grail.constants import ENVIRONMENT_NAME, VALIDATOR_HTTP_PORT
+
 app = typer.Typer(name="grail", help="GRAIL V1 — Verifiable Inference Subnet")
 
 
@@ -25,6 +27,14 @@ def mine(
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
     checkpoint: str = typer.Option(..., help="Model checkpoint path"),
+    environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name"),
+    validator_url: str = typer.Option(
+        "",
+        help=(
+            "Override the validator URL (otherwise discovered from the metagraph). "
+            "Useful for local testing — e.g. http://127.0.0.1:8888"
+        ),
+    ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Run GRAIL miner."""
@@ -35,7 +45,8 @@ def mine(
     os.environ["NETUID"] = str(netuid)
 
     logger.info(
-        "Starting GRAIL miner (network=%s, netuid=%d)", network, netuid
+        "Starting GRAIL miner (network=%s, netuid=%d, env=%s)",
+        network, netuid, environment,
     )
 
     async def _run():
@@ -44,7 +55,7 @@ def mine(
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from grail.constants import ATTN_IMPLEMENTATION, WINDOW_LENGTH
-        from grail.dataset.loader import load_dataset_cached
+        from grail.environment import load_environment
         from grail.infrastructure.chain import get_subtensor
         from grail.miner.engine import MiningEngine
 
@@ -68,9 +79,14 @@ def mine(
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to("cuda:1").eval()
 
-        dataset = load_dataset_cached()
+        env = load_environment(environment)
         engine = MiningEngine(
-            vllm_model, hf_model, tokenizer, wallet, dataset
+            vllm_model,
+            hf_model,
+            tokenizer,
+            wallet,
+            env,
+            validator_url_override=validator_url or None,
         )
 
         logger.info("Miner ready. Entering main loop.")
@@ -102,6 +118,9 @@ def validate(
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
     checkpoint: str = typer.Option(..., help="Model checkpoint path"),
+    environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name"),
+    http_host: str = typer.Option("0.0.0.0", help="HTTP bind address"),
+    http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Run GRAIL validator."""
@@ -112,7 +131,8 @@ def validate(
     os.environ["NETUID"] = str(netuid)
 
     logger.info(
-        "Starting GRAIL validator (network=%s, netuid=%d)", network, netuid
+        "Starting GRAIL validator (network=%s, netuid=%d, env=%s, http=%s:%d)",
+        network, netuid, environment, http_host, http_port,
     )
 
     async def _run():
@@ -121,7 +141,7 @@ def validate(
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from grail.constants import ATTN_IMPLEMENTATION
-        from grail.dataset.loader import load_dataset_cached
+        from grail.environment import load_environment
         from grail.infrastructure.chain import get_subtensor
         from grail.validator.service import ValidationService
 
@@ -139,9 +159,16 @@ def validate(
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to("cuda:0").eval()
 
-        dataset = load_dataset_cached()
+        env = load_environment(environment)
         service = ValidationService(
-            wallet, model, tokenizer, dataset, netuid, use_drand=use_drand
+            wallet,
+            model,
+            tokenizer,
+            env,
+            netuid,
+            use_drand=use_drand,
+            http_host=http_host,
+            http_port=http_port,
         )
         await service.run(subtensor)
 
