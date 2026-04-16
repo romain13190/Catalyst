@@ -459,3 +459,36 @@ class TestSketchForgeryResistance:
             )
         assert not result
         assert passed < checked
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FAILLE #6 — Proof version consistency in signature verification
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestProofVersionConsistency:
+    """verify_commit_signature must only accept the current GRAIL_PROOF_VERSION."""
+
+    def test_rejects_v4(self):
+        from grail.protocol.signatures import verify_commit_signature
+        commit = {
+            "tokens": [1, 2, 3],
+            "commitments": [{"sketch": 0}],
+            "proof_version": "v4",
+            "signature": "aa" * 64,
+            "beacon": {"randomness": "bb" * 32},
+            "model": {"name": "test", "layer_index": -1},
+        }
+        assert verify_commit_signature(commit, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY") is False
+
+    def test_rejects_unknown_version(self):
+        from grail.protocol.signatures import verify_commit_signature
+        commit = {
+            "tokens": [1, 2, 3],
+            "commitments": [{"sketch": 0}],
+            "proof_version": "v99",
+            "signature": "aa" * 64,
+            "beacon": {"randomness": "bb" * 32},
+            "model": {"name": "test", "layer_index": -1},
+        }
+        assert verify_commit_signature(commit, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY") is False

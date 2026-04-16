@@ -16,6 +16,7 @@ else:
         bt = None  # type: ignore
 
 from grail.protocol.tokens import hash_tokens
+from grail.constants import GRAIL_PROOF_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
         sig = bytes.fromhex(commit["signature"])
         proof_version = commit.get("proof_version")
 
-        if not proof_version or proof_version not in ("v4", "v5"):
+        if not proof_version or proof_version != GRAIL_PROOF_VERSION:
             logger.debug("Invalid proof version: %s", proof_version)
             return False
 
