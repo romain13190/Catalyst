@@ -21,6 +21,8 @@ dependencies = [
     "rich>=13.0.0",
     "tenacity>=8.0.0",
     "pyarrow>=14.0.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [project.optional-dependencies]
