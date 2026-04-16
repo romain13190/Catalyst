@@ -2,12 +2,16 @@
 
 import asyncio
 import gzip
+import hashlib
+import hmac
 import json
 import logging
 import os
 from typing import Any
 
 from aiobotocore.session import get_session
+
+from grail.constants import MAX_ROLLOUT_FILE_SIZE_BYTES
 from botocore.config import Config
 
 logger = logging.getLogger(__name__)
@@ -85,14 +89,32 @@ async def file_exists(key: str, **client_kwargs) -> bool:
         return False
 
 
-async def load_used_indices(**client_kwargs) -> dict[int, str]:
-    """Load the global used-indices map from S3.
+def _state_hmac_key() -> bytes:
+    """Derive HMAC key for state file integrity from validator's secret.
+
+    Uses R2_SECRET_ACCESS_KEY as the base secret — only the validator who
+    owns the bucket can produce or verify the HMAC.
+    """
+    secret = os.getenv("R2_SECRET_ACCESS_KEY", "").encode()
+    return hashlib.sha256(b"grail-state-hmac|" + secret).digest()
+
+
+def _compute_state_hmac(data: bytes) -> str:
+    return hmac.new(_state_hmac_key(), data, hashlib.sha256).hexdigest()
+
+
+async def load_used_indices(validator_id: str = "", **client_kwargs) -> dict[int, str]:
+    """Load the validator's used-indices map from S3.
+
+    Each validator uses its own state file to prevent concurrent validators
+    from overwriting each other's state.
 
     Returns:
         {dataset_index: hotkey} for every index ever credited.
-        Empty dict if file doesn't exist yet.
+        Empty dict if file doesn't exist yet or integrity check fails.
     """
-    key = "grail/state/used_indices.json.gz"
+    suffix = f"-{validator_id}" if validator_id else ""
+    key = f"grail/state/used_indices{suffix}.json.gz"
     try:
         async with get_s3_client(**client_kwargs) as client:
             bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "grail")
@@ -100,25 +122,44 @@ async def load_used_indices(**client_kwargs) -> dict[int, str]:
             body = await resp["Body"].read()
             body = gzip.decompress(body)
             raw = json.loads(body)
+
+            # SECURITY: Verify HMAC to detect tampering with the state file.
+            stored_hmac = raw.get("_hmac")
+            if stored_hmac:
+                data_without_hmac = {k: v for k, v in raw.items() if k != "_hmac"}
+                payload = json.dumps(data_without_hmac, sort_keys=True, separators=(",", ":")).encode()
+                expected_hmac = _compute_state_hmac(payload)
+                if not hmac.compare_digest(stored_hmac, expected_hmac):
+                    logger.error(
+                        "SECURITY: used_indices HMAC mismatch — state file may be tampered!"
+                    )
+                    return {}
+            else:
+                logger.warning("used_indices has no HMAC — first run or legacy file")
+
             # JSON keys are strings — convert back to int
-            return {int(k): v for k, v in raw.items()}
+            return {int(k): v for k, v in raw.items() if k != "_hmac"}
     except Exception as e:
         logger.info("No existing used_indices found (starting fresh): %s", e)
         return {}
 
 
-async def save_used_indices(used: dict[int, str], **client_kwargs) -> bool:
-    """Save the global used-indices map to S3."""
-    key = "grail/state/used_indices.json.gz"
+async def save_used_indices(used: dict[int, str], validator_id: str = "", **client_kwargs) -> bool:
+    """Save the validator's used-indices map to S3 with HMAC integrity."""
+    suffix = f"-{validator_id}" if validator_id else ""
+    key = f"grail/state/used_indices{suffix}.json.gz"
     # JSON keys must be strings
-    payload = json.dumps(
-        {str(k): v for k, v in used.items()}, separators=(",", ":")
-    ).encode()
+    data = {str(k): v for k, v in used.items()}
+    # Compute HMAC over the data before adding the HMAC field
+    payload_for_hmac = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    data["_hmac"] = _compute_state_hmac(payload_for_hmac)
+
+    payload = json.dumps(data, separators=(",", ":")).encode()
     compressed = gzip.compress(payload)
     async with get_s3_client(**client_kwargs) as client:
         bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "grail")
         await client.put_object(Bucket=bucket, Key=key, Body=compressed)
-    logger.info("Saved %d used indices (%d bytes)", len(used), len(compressed))
+    logger.info("Saved %d used indices (%d bytes, HMAC protected)", len(used), len(compressed))
     return True
 
 
@@ -166,14 +207,42 @@ async def download_window_rollouts(
     try:
         async with get_s3_client(**client_kwargs) as client:
             bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "grail")
+
+            # SECURITY: Check file size before downloading to prevent
+            # memory exhaustion from oversized or zip-bomb uploads.
+            head = await client.head_object(Bucket=bucket, Key=key)
+            content_length = head.get("ContentLength", 0)
+            if content_length > MAX_ROLLOUT_FILE_SIZE_BYTES:
+                logger.warning(
+                    "Rollout file %s too large: %d bytes (max %d)",
+                    key, content_length, MAX_ROLLOUT_FILE_SIZE_BYTES,
+                )
+                return None, None
+
             resp = await client.get_object(Bucket=bucket, Key=key)
             body = await resp["Body"].read()
+
             if key.endswith(".gz"):
-                body = gzip.decompress(body)
+                # Limit decompressed size to prevent zip bombs.
+                # A 10:1 ratio is generous for JSON; anything beyond is suspicious.
+                max_decompressed = min(
+                    MAX_ROLLOUT_FILE_SIZE_BYTES,
+                    content_length * 20,
+                )
+                decompressed = gzip.decompress(body)
+                if len(decompressed) > max_decompressed:
+                    logger.warning(
+                        "Decompressed rollout %s too large: %d bytes "
+                        "(compressed %d, limit %d)",
+                        key, len(decompressed), content_length, max_decompressed,
+                    )
+                    return None, None
+                body = decompressed
+
             data = json.loads(body)
 
             upload_time = None
-            last_modified = resp.get("LastModified")
+            last_modified = head.get("LastModified")
             if last_modified is not None:
                 upload_time = last_modified.timestamp()
 

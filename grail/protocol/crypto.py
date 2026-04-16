@@ -59,37 +59,21 @@ def prf(label: bytes, *parts: bytes, out_bytes: int) -> bytes:
         if not isinstance(part, bytes):
             raise TypeError(f"parts[{i}] must be bytes, got {type(part).__name__}")
 
-    # Use SHAKE256 for variable-length output if available (more efficient)
-    try:
-        if hasattr(hashlib, "shake_256"):
-            shake = hashlib.shake_256()
-            shake.update(label)
-            shake.update(b"||")
-            for part in parts[:-1] if parts else []:
-                shake.update(part)
-                shake.update(b"||")
-            if parts:
-                shake.update(parts[-1])
-            return shake.digest(out_bytes)
-    except Exception:
-        pass  # Fall back to SHA256 method
-
-    # SHA256-based expansion with counter mode
-    hash_size = 32
-    num_blocks = (out_bytes + hash_size - 1) // hash_size
-
-    if parts:
-        input_data = label + b"||" + b"||".join(parts)
-    else:
-        input_data = label
-
-    output = bytearray(num_blocks * hash_size)
-    for i in range(num_blocks):
-        block_input = input_data + i.to_bytes(4, "big")
-        block_hash = hashlib.sha256(block_input).digest()
-        output[i * hash_size : (i + 1) * hash_size] = block_hash
-
-    return bytes(output[:out_bytes])
+    # SECURITY: Use ONLY SHAKE256 — no fallback. Having two code paths
+    # (SHAKE256 vs SHA256 counter mode) that produce different outputs is
+    # dangerous: if miner and validator take different paths, all proofs
+    # break. SHAKE256 is available in Python 3.6+ via hashlib.
+    #
+    # Each part is length-prefixed (4-byte big-endian) to prevent ambiguity.
+    # Without length-prefixing, prf(label, b"a||b") and
+    # prf(label, b"a", b"", b"b") could collide.
+    shake = hashlib.shake_256()
+    shake.update(len(label).to_bytes(4, "big"))
+    shake.update(label)
+    for part in parts:
+        shake.update(len(part).to_bytes(4, "big"))
+        shake.update(part)
+    return shake.digest(out_bytes)
 
 
 def r_vec_from_randomness(rand_hex: str, d_model: int) -> torch.Tensor:  # type: ignore[misc]
