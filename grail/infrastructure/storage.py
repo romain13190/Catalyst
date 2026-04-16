@@ -194,6 +194,12 @@ async def upload_window_rollouts(
     return True
 
 
+async def upload_window_dataset(window_start: int, data: dict, **kwargs) -> bool:
+    """STUB — replaced by the Task 9 implementation."""
+    logger.info("upload_window_dataset stub: window=%d, slots=%d", window_start, len(data.get("slots", [])))
+    return True
+
+
 async def download_window_rollouts(
     hotkey: str, window_start: int, **client_kwargs
 ) -> tuple[list[dict] | None, float | None]:
