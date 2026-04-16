@@ -128,6 +128,10 @@ BATCH_FAILURE_THRESHOLD = 0.30
 
 WEIGHT_SUBMISSION_INTERVAL = 360  # Blocks between weight submissions
 
+# How many windows of index history to retain before purging.
+# Indices older than this are freed for reuse.
+USED_INDICES_MAX_AGE_WINDOWS = 100
+
 # ────────────────  DATASET  ────────────────
 
 DATASET_NAME = "karpathy/climbmix-400b-shuffle"

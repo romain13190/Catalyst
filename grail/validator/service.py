@@ -8,6 +8,7 @@ from collections import defaultdict
 
 from grail.constants import (
     BATCH_FAILURE_THRESHOLD,
+    FAILURE_LOOKBACK_WINDOWS,
     MAX_ROLLOUTS_PER_FILE,
     MAX_TOKENS_PER_ROLLOUT,
     MINER_SAMPLE_MAX,
@@ -16,6 +17,7 @@ from grail.constants import (
     POLL_INTERVAL_SECONDS,
     ROLLOUT_SAMPLE_MIN,
     ROLLOUT_SAMPLE_RATE,
+    USED_INDICES_MAX_AGE_WINDOWS,
     VERIFICATION_BATCH_SIZE,
     WEIGHT_SUBMISSION_INTERVAL,
     WINDOW_LENGTH,
@@ -64,6 +66,12 @@ class ValidationService:
         # race conditions when multiple validators write concurrently.
         self._used_indices: dict[int, str] = {}
         self._validator_hotkey: str = wallet.hotkey.ss58_address
+
+        # {hotkey: last_gated_window} — tracks when miners were last gated
+        self._gated_history: dict[str, int] = {}
+
+        # {dataset_index: window_start} — tracks when each index was credited
+        self._index_windows: dict[int, int] = {}
 
     async def run(self, subtensor):
         """Main validation loop — poll continuously."""
@@ -138,6 +146,12 @@ class ValidationService:
             active_hotkeys, min(sample_size, len(active_hotkeys))
         )
 
+        # Exclude miners who were recently gated
+        selected = [
+            hk for hk in selected
+            if not self._is_miner_excluded(hk, target_window)
+        ]
+
         logger.info(
             "Selected %d/%d miners for validation",
             len(selected), len(active_hotkeys),
@@ -194,6 +208,9 @@ class ValidationService:
             self._miner_metrics[hotkey]["valid"] += len(new_indices)
             self._miner_metrics[hotkey]["unique"] += len(new_indices)
             self._miner_metrics[hotkey]["total"] += total
+
+        # Purge expired indices before persisting
+        self._purge_old_indices(target_window)
 
         # Persist state after each window
         await storage.save_used_indices(
@@ -310,21 +327,61 @@ class ValidationService:
                 break
 
         if gated:
+            self._record_gating(hotkey, self._last_processed_window + WINDOW_LENGTH)
             return set(), total_unique
 
-        # All batches passed — credit all fresh indices
+        # Credit proportional to verified pass rate
+        if verified_total == 0:
+            return set(), total_unique
+
+        pass_rate = verified_valid / verified_total
+
+        # Deterministically select which fresh rollouts get credit
+        # based on the pass rate. Shuffle with the same rng for reproducibility.
+        credit_count = int(len(fresh_rollouts) * pass_rate)
+        credit_indices_order = list(range(len(fresh_rollouts)))
+        rng.shuffle(credit_indices_order)
+        credit_indices_order = credit_indices_order[:credit_count]
+
         new_indices = set()
-        for rollout in fresh_rollouts:
-            idx = rollout["dataset_index"]
+        current_window = self._last_processed_window + WINDOW_LENGTH
+        for i in credit_indices_order:
+            idx = fresh_rollouts[i]["dataset_index"]
             new_indices.add(idx)
             self._used_indices[idx] = hotkey
+            self._index_windows[idx] = current_window
 
         logger.info(
-            "Miner %s: %d/%d verified passed — crediting %d new indices (%d total used)",
+            "Miner %s: %d/%d verified passed (%.0f%%) — crediting %d/%d fresh indices (%d total used)",
             hotkey[:8], verified_valid, verified_total,
-            len(new_indices), len(self._used_indices),
+            100 * pass_rate, len(new_indices), len(fresh_rollouts),
+            len(self._used_indices),
         )
         return new_indices, total_unique
+
+    def _record_gating(self, hotkey: str, window: int) -> None:
+        """Record that a miner was gated in this window."""
+        self._gated_history[hotkey] = window
+
+    def _is_miner_excluded(self, hotkey: str, current_window: int) -> bool:
+        """Check if a miner is excluded due to recent gating."""
+        last_gated = self._gated_history.get(hotkey)
+        if last_gated is None:
+            return False
+        lookback_blocks = FAILURE_LOOKBACK_WINDOWS * WINDOW_LENGTH
+        return (current_window - last_gated) < lookback_blocks
+
+    def _purge_old_indices(self, current_window: int) -> None:
+        """Remove used indices older than USED_INDICES_MAX_AGE_WINDOWS."""
+        cutoff = current_window - USED_INDICES_MAX_AGE_WINDOWS * WINDOW_LENGTH
+        to_remove = [
+            idx for idx, w in self._index_windows.items() if w < cutoff
+        ]
+        for idx in to_remove:
+            self._used_indices.pop(idx, None)
+            self._index_windows.pop(idx, None)
+        if to_remove:
+            logger.info("Purged %d expired indices (cutoff window=%d)", len(to_remove), cutoff)
 
     async def _submit_weights(self, subtensor):
         """Compute and submit weights on-chain."""
