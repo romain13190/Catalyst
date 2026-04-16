@@ -63,9 +63,15 @@ class MiningEngine:
         """Generate as many rollouts as possible within the window and upload."""
         block_hash = await chain.get_block_hash(subtensor, window_start)
         if use_drand:
-            beacon = get_beacon(use_drand=True)
+            from grail.infrastructure.drand import get_current_chain
+
+            chain_info = get_current_chain()
+            drand_round = chain.compute_drand_round_for_window(
+                window_start, chain_info["genesis_time"], chain_info["period"]
+            )
+            beacon = get_beacon(round_id=str(drand_round), use_drand=True)
             randomness = chain.compute_window_randomness(
-                block_hash, beacon["randomness"]
+                block_hash, beacon["randomness"], drand_round=beacon["round"]
             )
         else:
             randomness = chain.compute_window_randomness(block_hash)

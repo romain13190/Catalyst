@@ -19,7 +19,6 @@ from grail.constants import (
     WINDOW_LENGTH,
 )
 from grail.infrastructure import chain, storage
-from grail.infrastructure.drand import get_beacon
 from grail.validator.verifier import verify_rollout
 from grail.validator.weights import compute_weights
 
@@ -45,13 +44,18 @@ class ValidationService:
         )
         self._windows_in_interval: int = 0
 
-        # Global index dedup: {dataset_index: hotkey} — loaded from S3 at startup
+        # Global index dedup: {dataset_index: hotkey} — loaded from S3 at startup.
+        # Each validator uses its own state file keyed by its hotkey to prevent
+        # race conditions when multiple validators write concurrently.
         self._used_indices: dict[int, str] = {}
+        self._validator_hotkey: str = wallet.hotkey.ss58_address
 
     async def run(self, subtensor):
         """Main validation loop — poll continuously."""
-        # Load persisted state from S3
-        self._used_indices = await storage.load_used_indices()
+        # Load persisted state from S3 (isolated per validator hotkey)
+        self._used_indices = await storage.load_used_indices(
+            validator_id=self._validator_hotkey
+        )
         logger.info(
             "Starting validation service (netuid=%d, poll=%ds, %d used indices loaded)",
             self.netuid, POLL_INTERVAL_SECONDS, len(self._used_indices),
@@ -88,9 +92,15 @@ class ValidationService:
         """Process a window: discover miners, verify each as files appear."""
         block_hash = await chain.get_block_hash(subtensor, target_window)
         if self.use_drand:
-            beacon = get_beacon(use_drand=True)
+            from grail.infrastructure.drand import get_beacon, get_current_chain
+
+            chain_info = get_current_chain()
+            drand_round = chain.compute_drand_round_for_window(
+                target_window, chain_info["genesis_time"], chain_info["period"]
+            )
+            beacon = get_beacon(round_id=str(drand_round), use_drand=True)
             randomness = chain.compute_window_randomness(
-                block_hash, beacon["randomness"]
+                block_hash, beacon["randomness"], drand_round=beacon["round"]
             )
         else:
             randomness = chain.compute_window_randomness(block_hash)
@@ -118,8 +128,8 @@ class ValidationService:
             len(selected), len(active_hotkeys),
         )
 
-        # Process each miner as their file becomes available
-        window_results: dict[str, dict] = {}
+        # Phase 1: Collect all miner files (wait for uploads)
+        collected: dict[str, tuple[list[dict], float | None]] = {}
         pending = set(selected)
         attempts = 0
         max_attempts = 30  # ~5 minutes at 10s poll
@@ -131,23 +141,8 @@ class ValidationService:
                 )
                 if rollouts is None:
                     continue
-
                 pending.discard(hotkey)
-
-                new_indices, total = await self._verify_miner(
-                    hotkey, rollouts, randomness, rng,
-                )
-
-                # Record results
-                window_results[hotkey] = {
-                    "unique": len(new_indices),
-                    "total": total,
-                    "indices": list(new_indices),
-                }
-
-                self._miner_metrics[hotkey]["valid"] += len(new_indices)
-                self._miner_metrics[hotkey]["unique"] += len(new_indices)
-                self._miner_metrics[hotkey]["total"] += total
+                collected[hotkey] = (rollouts, upload_time)
 
             if pending:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -159,8 +154,36 @@ class ValidationService:
                 len(pending), target_window,
             )
 
+        # Phase 2: Process miners in upload-time order (earliest first).
+        # This ensures that when two miners submit the same dataset index,
+        # the one who uploaded first keeps credit — not whoever the validator
+        # happened to poll first.
+        sorted_miners = sorted(
+            collected.items(),
+            key=lambda item: item[1][1] if item[1][1] is not None else float("inf"),
+        )
+
+        window_results: dict[str, dict] = {}
+        for hotkey, (rollouts, upload_time) in sorted_miners:
+            new_indices, total = await self._verify_miner(
+                hotkey, rollouts, randomness, rng,
+            )
+
+            window_results[hotkey] = {
+                "unique": len(new_indices),
+                "total": total,
+                "indices": list(new_indices),
+                "upload_time": upload_time,
+            }
+
+            self._miner_metrics[hotkey]["valid"] += len(new_indices)
+            self._miner_metrics[hotkey]["unique"] += len(new_indices)
+            self._miner_metrics[hotkey]["total"] += total
+
         # Persist state after each window
-        await storage.save_used_indices(self._used_indices)
+        await storage.save_used_indices(
+            self._used_indices, validator_id=self._validator_hotkey
+        )
         await storage.save_window_results(target_window, window_results)
 
     async def _verify_miner(

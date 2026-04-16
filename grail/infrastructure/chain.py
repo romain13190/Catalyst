@@ -6,6 +6,8 @@ import logging
 import os
 from typing import Any
 
+from grail.constants import BLOCK_TIME_SECONDS
+
 logger = logging.getLogger(__name__)
 
 NETUID = int(os.getenv("NETUID", "81"))
@@ -58,14 +60,38 @@ async def set_weights(
         return False
 
 
+def compute_drand_round_for_window(
+    window_start_block: int, genesis_time: int, period: int
+) -> int:
+    """Deterministically compute which drand round to use for a window.
+
+    Both miner and validator call this with the same inputs to agree
+    on a single round — no "latest" fetch needed.
+
+    Returns:
+        The drand round number (>= 1).
+    """
+    window_timestamp = window_start_block * BLOCK_TIME_SECONDS
+    if window_timestamp < genesis_time:
+        return 1  # Clamp: can't go before round 1
+    return 1 + (window_timestamp - genesis_time) // period
+
+
 def compute_window_randomness(
-    block_hash: str, drand_randomness: str | None = None
+    block_hash: str,
+    drand_randomness: str | None = None,
+    drand_round: int | None = None,
 ) -> str:
-    """Combine block hash and optional drand randomness into window randomness."""
+    """Combine block hash, drand randomness, and round into window randomness.
+
+    Including the round number prevents a miner from choosing a round
+    whose randomness is favorable.
+    """
     clean_hash = block_hash.replace("0x", "")
     if drand_randomness:
-        combined = hashlib.sha256(
-            bytes.fromhex(clean_hash) + bytes.fromhex(drand_randomness)
-        ).hexdigest()
+        material = bytes.fromhex(clean_hash) + bytes.fromhex(drand_randomness)
+        if drand_round is not None:
+            material += drand_round.to_bytes(8, "big")
+        combined = hashlib.sha256(material).hexdigest()
         return combined
     return clean_hash
