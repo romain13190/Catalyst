@@ -8,6 +8,8 @@ from collections import defaultdict
 
 from grail.constants import (
     BATCH_FAILURE_THRESHOLD,
+    MAX_ROLLOUTS_PER_FILE,
+    MAX_TOKENS_PER_ROLLOUT,
     MINER_SAMPLE_MAX,
     MINER_SAMPLE_MIN,
     MINER_SAMPLE_RATE,
@@ -25,6 +27,19 @@ from grail.validator.weights import compute_weights
 logger = logging.getLogger(__name__)
 
 ROLLING_WINDOWS = WEIGHT_SUBMISSION_INTERVAL // WINDOW_LENGTH  # 12
+
+
+def _filter_rollouts(rollouts: list[dict]) -> list[dict]:
+    """Drop rollouts that exceed protocol limits on count or token length."""
+    filtered = []
+    for rollout in rollouts:
+        tokens = rollout.get("commit", {}).get("tokens", [])
+        if len(tokens) > MAX_TOKENS_PER_ROLLOUT:
+            continue
+        filtered.append(rollout)
+        if len(filtered) >= MAX_ROLLOUTS_PER_FILE:
+            break
+    return filtered
 
 
 class ValidationService:
@@ -205,6 +220,8 @@ class ValidationService:
             (new_valid_indices, total_unique_submitted)
             If gated, new_valid_indices is empty.
         """
+        rollouts = _filter_rollouts(rollouts)
+
         # Deduplicate by dataset_index within this submission
         seen_indices: set[int] = set()
         unique_rollouts: list[dict] = []

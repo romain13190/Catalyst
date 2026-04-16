@@ -96,6 +96,12 @@ FAILURE_LOOKBACK_WINDOWS = 14
 MIN_ROLLOUT_FILE_SIZE_BYTES = 200
 MAX_ROLLOUT_FILE_SIZE_BYTES = 350 * 1024 * 1024  # 350 MB
 
+# Maximum number of rollouts per submission file.
+MAX_ROLLOUTS_PER_FILE = 6000
+
+# Maximum token sequence length in a single rollout.
+MAX_TOKENS_PER_ROLLOUT = MAX_NEW_TOKENS_PROTOCOL_CAP + 4096  # prompt + completion
+
 # Soft check threshold for stochastic failures.
 STOCHASTIC_CHECK_FAILURE_THRESHOLD = 0.51
 
