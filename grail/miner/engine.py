@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from grail.constants import (
     BLOCK_TIME_SECONDS,
+    COMPLETIONS_PER_CLASS,
     COMPLETIONS_PER_SUBMISSION,
     DIVERSITY_PREFIX_LEN,
     LAYER_INDEX,
@@ -124,20 +125,31 @@ class MiningEngine:
                     )
                     break
 
-                # 6b. Fetch window state to skip already-settled slots
+                # 6b. Fetch window state to decide strategy:
+                #     - skip if slot is settled or both quotas full
+                #     - pick target reward class (rare) to maximise advantage
+                target_reward: float | None = None
                 try:
                     state = await get_window_state(url, window_start, client=client)
                     slot_state = next(
                         (s for s in state.slot_states if s.slot_index == slot_index),
                         None,
                     )
-                    if slot_state is not None and slot_state.settled:
-                        logger.debug("slot %d already settled, skipping", slot_index)
-                        continue
+                    if slot_state is not None:
+                        if slot_state.settled:
+                            logger.debug("slot %d already settled, skipping", slot_index)
+                            continue
+                        target_reward = self._choose_target_reward(slot_state.rewards)
+                        if target_reward == "both_full":
+                            logger.debug(
+                                "slot %d: both quotas near-full, skipping", slot_index,
+                            )
+                            continue
                 except SubmissionError as exc:
-                    # Window not active yet or racing the validator — attempt anyway.
+                    # Window not active yet or racing the validator — attempt anyway
+                    # with no targeting (target_reward stays None).
                     logger.debug(
-                        "get_window_state for slot %d failed (%s); submitting anyway",
+                        "get_window_state for slot %d failed (%s); submitting untargeted",
                         slot_index, exc,
                     )
                 except Exception as exc:
@@ -147,13 +159,17 @@ class MiningEngine:
                     )
                     continue
 
-                # 6c. Generate 4 prefix-distinct completions
-                diverse = self._generate_diverse_batch(problem, randomness)
+                # 6c. Generate 4 prefix-distinct completions, targeting the
+                # picked reward class if any (sample-and-filter locally).
+                diverse = self._generate_targeted_batch(
+                    problem, randomness, target_reward,
+                )
                 if len(diverse) < COMPLETIONS_PER_SUBMISSION:
                     logger.warning(
-                        "slot %d: only got %d distinct-prefix completions after "
-                        "max attempts (need %d) — skipping",
-                        slot_index, len(diverse), COMPLETIONS_PER_SUBMISSION,
+                        "slot %d: only got %d completions after max attempts "
+                        "(target_reward=%s, need %d) — skipping",
+                        slot_index, len(diverse), target_reward,
+                        COMPLETIONS_PER_SUBMISSION,
                     )
                     continue
 
@@ -209,15 +225,63 @@ class MiningEngine:
             )
         return chain.compute_window_randomness(block_hash)
 
-    def _generate_diverse_batch(self, problem: dict, randomness: str) -> list[dict]:
-        """Generate up to COMPLETIONS_PER_SUBMISSION completions with distinct prefixes.
+    @staticmethod
+    def _choose_target_reward(rewards_hist: dict[str, int]):
+        """Pick the reward class the miner should target for this slot.
 
-        Retries up to 10 times on prefix collision.  Returns however many
-        distinct completions were found (caller skips the slot if < 4).
+        Strategy:
+          * If one class has quota remaining for a full batch of 4 and the
+            other doesn't → produce the class with room.
+          * If both have room → target the RARE one (smaller count) to
+            maximise |advantage| at settlement.
+          * Ties → fall back to None (indifferent; produce whatever the
+            model outputs naturally).
+          * If neither class has room for 4 more → return the sentinel
+            string ``"both_full"`` so the caller skips the slot.
+
+        Returns:
+            1.0, 0.0, None, or the sentinel ``"both_full"``.
+        """
+        count_1 = rewards_hist.get("1.0", 0)
+        count_0 = rewards_hist.get("0.0", 0)
+        remaining_1 = COMPLETIONS_PER_CLASS - count_1
+        remaining_0 = COMPLETIONS_PER_CLASS - count_0
+
+        if remaining_1 < COMPLETIONS_PER_SUBMISSION and remaining_0 < COMPLETIONS_PER_SUBMISSION:
+            return "both_full"
+        if remaining_1 < COMPLETIONS_PER_SUBMISSION:
+            return 0.0
+        if remaining_0 < COMPLETIONS_PER_SUBMISSION:
+            return 1.0
+        if count_1 < count_0:
+            return 1.0
+        if count_0 < count_1:
+            return 0.0
+        return None  # balanced / empty — no preference
+
+    def _generate_targeted_batch(
+        self,
+        problem: dict,
+        randomness: str,
+        target_reward: float | None,
+    ) -> list[dict]:
+        """Generate up to COMPLETIONS_PER_SUBMISSION prefix-distinct completions,
+        optionally filtered to match ``target_reward``.
+
+        Uses the env locally to score each candidate (deterministic — same
+        formula as the validator). Rejects candidates whose first
+        ``DIVERSITY_PREFIX_LEN`` tokens collide with an earlier accepted
+        candidate. Caps attempts to avoid unbounded loops when the model
+        can't produce the target class for this prompt.
         """
         import torch
 
-        _MAX_ATTEMPTS = 10
+        # Generous attempt cap: 10× the target batch size. Enough for typical
+        # rejection sampling without blowing up when the model is near-
+        # deterministic on this prompt (in which case we give up and let
+        # the caller skip the slot).
+        max_attempts = COMPLETIONS_PER_SUBMISSION * 10
+
         prompt_tokens: list[int] = self.tokenizer.encode(
             problem["prompt"], add_special_tokens=False
         )
@@ -226,7 +290,7 @@ class MiningEngine:
         seen_prefixes: set[tuple] = set()
         completions: list[dict] = []
 
-        for _attempt in range(_MAX_ATTEMPTS):
+        for _ in range(max_attempts):
             if len(completions) >= COMPLETIONS_PER_SUBMISSION:
                 break
 
@@ -243,6 +307,14 @@ class MiningEngine:
             all_tokens: list[int] = outputs[0].tolist()
             completion_tokens = all_tokens[prompt_length:]
 
+            # Filter by target reward if requested.
+            if target_reward is not None:
+                completion_text = self.tokenizer.decode(completion_tokens)
+                reward = self.env.compute_reward(problem, completion_text)
+                if reward != target_reward:
+                    continue
+
+            # Prefix dedup (intra-batch — the validator also enforces cross-miner).
             prefix = tuple(completion_tokens[:DIVERSITY_PREFIX_LEN])
             if prefix in seen_prefixes:
                 continue

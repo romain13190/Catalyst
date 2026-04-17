@@ -159,7 +159,7 @@ async def test_mine_window_skips_settled_slots():
          "completion_tokens": [i, 0, 0, 0]}
         for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
     ]
-    engine._generate_diverse_batch = MagicMock(return_value=diverse)
+    engine._generate_targeted_batch = MagicMock(return_value=diverse)
 
     # Time never expires
     monotonic_vals = [0.0] * 100
@@ -202,7 +202,7 @@ async def test_mine_window_stops_at_deadline():
          "completion_tokens": [i, 0, 0, 0]}
         for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
     ]
-    engine._generate_diverse_batch = MagicMock(return_value=diverse)
+    engine._generate_targeted_batch = MagicMock(return_value=diverse)
 
     # First call: inside deadline (deadline computed from first call value)
     # mine_window logic:
@@ -245,7 +245,7 @@ async def test_mine_window_skips_slot_when_diverse_batch_fails():
          "completion_tokens": [i, 0, 0, 0]}
         for i in range(1, 3)
     ]
-    engine._generate_diverse_batch = MagicMock(return_value=only_two)
+    engine._generate_targeted_batch = MagicMock(return_value=only_two)
 
     monotonic_vals = iter([0.0] * 100)
 
@@ -268,6 +268,193 @@ async def test_mine_window_skips_slot_when_diverse_batch_fails():
     assert mock_submit.call_count == 0
 
 
+# ---------------------------------------------------------------------------
+# Smart strategy tests: _choose_target_reward + rare-class targeting
+# ---------------------------------------------------------------------------
+
+
+from grail.constants import COMPLETIONS_PER_CLASS
+from grail.miner.engine import MiningEngine
+
+
+class TestChooseTargetReward:
+    def test_empty_histogram_no_preference(self) -> None:
+        assert MiningEngine._choose_target_reward({}) is None
+
+    def test_balanced_no_preference(self) -> None:
+        assert MiningEngine._choose_target_reward({"1.0": 10, "0.0": 10}) is None
+
+    def test_imbalanced_picks_rare_class(self) -> None:
+        # count_1=20, count_0=5 → 0.0 is rarer
+        assert MiningEngine._choose_target_reward({"1.0": 20, "0.0": 5}) == 0.0
+        # count_1=5, count_0=20 → 1.0 is rarer
+        assert MiningEngine._choose_target_reward({"1.0": 5, "0.0": 20}) == 1.0
+
+    def test_picks_other_class_when_one_full(self) -> None:
+        # class 1.0 has no room left → must pick 0.0
+        almost = COMPLETIONS_PER_CLASS - 3  # only 3 left, can't fit a batch of 4
+        assert (
+            MiningEngine._choose_target_reward({"1.0": almost, "0.0": 10}) == 0.0
+        )
+
+    def test_both_near_full_returns_sentinel(self) -> None:
+        almost = COMPLETIONS_PER_CLASS - 3
+        assert (
+            MiningEngine._choose_target_reward({"1.0": almost, "0.0": almost})
+            == "both_full"
+        )
+
+
+class TestGenerateTargetedBatch:
+    def _build_engine_with_env_rewards(self, reward_seq):
+        """Build an engine whose FakeEnv returns rewards from ``reward_seq`` in order."""
+        engine = _make_engine(validator_url_override="http://localhost")
+        rewards = iter(reward_seq)
+        engine.env.compute_reward = MagicMock(side_effect=lambda p, c: next(rewards))
+
+        # Rotate completion tokens so prefix dedup accepts them all.
+        counter = {"n": 0}
+
+        def fake_generate(input_tensor, **kwargs):
+            counter["n"] += 1
+            tokens = [10, 20, 30, 40, 50, counter["n"], 99, 99, 99, 99, 99, 99, 99]
+            output = MagicMock()
+            output.__getitem__ = lambda self, i: MagicMock(
+                tolist=MagicMock(return_value=tokens)
+            )
+            return output
+
+        engine.vllm_model.generate = MagicMock(side_effect=fake_generate)
+        return engine
+
+    def test_no_target_accepts_all(self) -> None:
+        # env irrelevant when target is None
+        engine = self._build_engine_with_env_rewards([0.0] * 10)
+        problem = {"prompt": "Q", "ground_truth": "42", "id": "p"}
+        batch = engine._generate_targeted_batch(problem, "ab" * 32, target_reward=None)
+        assert len(batch) == COMPLETIONS_PER_SUBMISSION
+        # Should NOT have called compute_reward when target is None
+        engine.env.compute_reward.assert_not_called()
+
+    def test_target_filters_out_wrong_reward(self) -> None:
+        # Alternate 0.0 / 1.0 — target 1.0 keeps every other attempt.
+        engine = self._build_engine_with_env_rewards([0.0, 1.0] * 20)
+        problem = {"prompt": "Q", "ground_truth": "42", "id": "p"}
+        batch = engine._generate_targeted_batch(problem, "ab" * 32, target_reward=1.0)
+        assert len(batch) == COMPLETIONS_PER_SUBMISSION
+        # Needed at least 8 attempts (4 rejected + 4 kept).
+        assert engine.vllm_model.generate.call_count >= 8
+
+    def test_gives_up_when_model_cant_produce_target(self) -> None:
+        # Env always returns 0.0, target is 1.0 → no completion ever matches.
+        engine = self._build_engine_with_env_rewards([0.0] * 100)
+        problem = {"prompt": "Q", "ground_truth": "42", "id": "p"}
+        batch = engine._generate_targeted_batch(problem, "ab" * 32, target_reward=1.0)
+        assert batch == []
+        # Cap is COMPLETIONS_PER_SUBMISSION * 10 = 40
+        assert engine.vllm_model.generate.call_count == COMPLETIONS_PER_SUBMISSION * 10
+
+
+class TestMinerUsesRewardsHistogram:
+    @pytest.mark.asyncio
+    async def test_target_reward_passed_to_generator_based_on_state(self) -> None:
+        """When /state shows imbalance, miner calls _generate_targeted_batch with
+        the rare class as target_reward."""
+        engine = _make_engine(validator_url_override="http://localhost:8888")
+        engine._build_completion_submission = MagicMock(
+            return_value=_stub_completion_submission()
+        )
+        diverse = [
+            {"tokens": [10, 20, 30, 40, 50, i, 0, 0, 0],
+             "prompt_length": 5,
+             "completion_tokens": [i, 0, 0, 0]}
+            for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
+        ]
+        engine._generate_targeted_batch = MagicMock(return_value=diverse)
+
+        # Slot 0 imbalanced: 40 corrects vs 10 wrongs → miner should target 0.0
+        state = WindowStateResponse(
+            window_start=1000,
+            slot_states=[
+                SlotState(
+                    slot_index=i,
+                    prompt_id=f"id-{i:04d}",
+                    count=50 if i == 0 else 0,
+                    settled=False,
+                    rewards={"1.0": 40, "0.0": 10} if i == 0 else {},
+                )
+                for i in range(PROMPTS_PER_WINDOW)
+            ],
+        )
+
+        monotonic_vals = iter([0.0] * 100)
+        with (
+            patch(PATCH_CHAIN_HASH, new=AsyncMock(return_value="abc")),
+            patch(PATCH_CHAIN_RANDOMNESS, return_value="aa" * 32),
+            patch(PATCH_GET_WINDOW_STATE, new=AsyncMock(return_value=state)),
+            patch(PATCH_SUBMIT_BATCH, new=AsyncMock(return_value=_accepted_response())),
+            patch(PATCH_TIME, side_effect=lambda: next(monotonic_vals)),
+        ):
+            await engine.mine_window(
+                subtensor=MagicMock(), window_start=1000, use_drand=False,
+            )
+
+        # First call is for slot 0 with target_reward=0.0 (rare class)
+        first_call = engine._generate_targeted_batch.call_args_list[0]
+        assert first_call.args[2] == 0.0  # target_reward kwarg
+
+    @pytest.mark.asyncio
+    async def test_both_quotas_near_full_skips_slot(self) -> None:
+        """Both quotas have < 4 remaining → slot is skipped, no generate, no submit."""
+        engine = _make_engine(validator_url_override="http://localhost:8888")
+        engine._generate_targeted_batch = MagicMock()  # must NOT be called for slot 0
+        engine._build_completion_submission = MagicMock(
+            return_value=_stub_completion_submission()
+        )
+
+        almost = COMPLETIONS_PER_CLASS - 2
+        state = WindowStateResponse(
+            window_start=1000,
+            slot_states=[
+                SlotState(
+                    slot_index=i,
+                    prompt_id=f"id-{i:04d}",
+                    count=0,
+                    settled=False,
+                    rewards=(
+                        {"1.0": almost, "0.0": almost} if i == 0 else {}
+                    ),
+                )
+                for i in range(PROMPTS_PER_WINDOW)
+            ],
+        )
+
+        # Any other slots still accept — let the engine iterate normally.
+        engine._generate_targeted_batch.side_effect = lambda *args, **kw: [
+            {"tokens": [10, 20, 30, 40, 50, i, 0, 0, 0],
+             "prompt_length": 5,
+             "completion_tokens": [i, 0, 0, 0]}
+            for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
+        ]
+
+        monotonic_vals = iter([0.0] * 100)
+        with (
+            patch(PATCH_CHAIN_HASH, new=AsyncMock(return_value="abc")),
+            patch(PATCH_CHAIN_RANDOMNESS, return_value="aa" * 32),
+            patch(PATCH_GET_WINDOW_STATE, new=AsyncMock(return_value=state)),
+            patch(PATCH_SUBMIT_BATCH, new=AsyncMock(return_value=_accepted_response())) as mock_submit,
+            patch(PATCH_TIME, side_effect=lambda: next(monotonic_vals)),
+        ):
+            await engine.mine_window(
+                subtensor=MagicMock(), window_start=1000, use_drand=False,
+            )
+
+        # 7 slots submitted (slot 0 skipped).
+        assert mock_submit.call_count == PROMPTS_PER_WINDOW - 1
+        submitted_slots = [c.args[1].slot_index for c in mock_submit.call_args_list]
+        assert 0 not in submitted_slots
+
+
 @pytest.mark.asyncio
 async def test_validator_url_override_skips_metagraph_lookup():
     """When validator_url_override is set, subtensor is never touched."""
@@ -281,7 +468,7 @@ async def test_validator_url_override_skips_metagraph_lookup():
          "completion_tokens": [i, 0, 0, 0]}
         for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
     ]
-    engine._generate_diverse_batch = MagicMock(return_value=diverse)
+    engine._generate_targeted_batch = MagicMock(return_value=diverse)
 
     # Subtensor that explodes on any attribute access
     class _ExplodingSubtensor:
