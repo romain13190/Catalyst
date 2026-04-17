@@ -37,62 +37,33 @@ logger = logging.getLogger(__name__)
 
 
 def _finalize_slot(slot: "ProblemSlot") -> None:
-    """Pick the balanced subset of accepted completions that will receive credit.
+    """Freeze the slot — no further submissions accepted from this point.
 
-    Mechanics (binary rewards):
-      * For each reward class present, the ``accepted_by_reward`` list is
-        already in arrival order (we append as we accept).
-      * Kept per class = min(count of rarest present class, COMPLETIONS_PER_CLASS).
-      * Mark ``kept = True`` on the first N completions of each present class.
-      * If only one class is present, kept stays 0 for every completion —
-        the slot is unusable for GRPO (can't compute advantages) and its
-        entire emission budget burns.
+    Scoring happens separately via ``_compute_slot_scores`` on the
+    accepted completions (balanced or not). The quota layer already caps
+    each reward class at COMPLETIONS_PER_CLASS, so an imbalanced timeout
+    settlement (say 50 corrects + 20 wrongs) naturally pays everyone via
+    advantage scoring: the rare class earns more |z-score| per completion,
+    the common class earns less, dégénéré slots (std=0) pay zero.
 
-    Once kept flags are set, the existing advantage-based scorer
-    (``_compute_slot_scores``) naturally pays uniform |adv|=1.0 per kept
-    completion (balanced → max std). Not kept = 0 points. The scoring
-    formula is unchanged; curation just determines what's eligible.
-
-    Idempotent: calling twice is a no-op after ``slot.finalized`` is set.
+    Idempotent.
     """
-    if slot.finalized:
-        return
     slot.finalized = True
-
-    class_indices = slot.accepted_by_reward
-    if len(class_indices) < 2:
-        return  # dégénéré — nothing kept
-
-    kept_per_class = min(
-        min(len(idx) for idx in class_indices.values()),
-        COMPLETIONS_PER_CLASS,
-    )
-    if kept_per_class == 0:
-        return
-
-    for indices in class_indices.values():
-        for i in indices[:kept_per_class]:
-            slot.accepted_completions[i].kept = True
 
 
 def _compute_slot_scores(slot: "ProblemSlot") -> dict[str, float]:
     """Per-miner advantage contribution within a single slot.
 
-    Score per kept completion = ``|reward - mean| / std`` (population std,
-    computed over the kept subset). Sums per miner_hotkey. Returns empty
-    dict when fewer than 2 kept completions OR std == 0 (dégénéré — no
-    GRPO signal to pay for).
-
-    The finalize step typically produces a class-balanced kept subset, in
-    which case |adv| = 1.0 uniformly — equivalent to a flat 1-per-kept
-    payout. This formula still handles future non-binary reward cases
-    where the kept set may have variance in per-class reward values.
+    Score per accepted completion = ``|reward - mean| / std`` (population
+    std over the slot). Sums per miner_hotkey. Returns empty dict when
+    fewer than 2 completions OR std == 0 (dégénéré — no GRPO signal to
+    pay for; the slot's emission share becomes burn).
     """
-    kept = [c for c in slot.accepted_completions if c.kept]
-    if len(kept) < 2:
+    completions = slot.accepted_completions
+    if len(completions) < 2:
         return {}
 
-    rewards = [c.reward for c in kept]
+    rewards = [c.reward for c in completions]
     n = len(rewards)
     mean = sum(rewards) / n
     var = sum((r - mean) ** 2 for r in rewards) / n  # population variance
@@ -101,7 +72,7 @@ def _compute_slot_scores(slot: "ProblemSlot") -> dict[str, float]:
     std = var ** 0.5
 
     contribs: dict[str, float] = {}
-    for c in kept:
+    for c in completions:
         adv = abs(c.reward - mean) / std
         contribs[c.miner_hotkey] = contribs.get(c.miner_hotkey, 0.0) + adv
     return contribs
@@ -165,9 +136,8 @@ class AcceptedCompletion:
     tokens: list[int]
     commit: dict
     reward: float
-    completion_text: str  # decoded text after the prompt
-    arrived_at: float = 0.0  # monotonic timestamp at accept — used for "first come wins"
-    kept: bool = False       # set by _finalize_slot for completions in the balanced subset
+    completion_text: str          # decoded text after the prompt
+    arrived_at: float = 0.0       # monotonic timestamp at accept
 
 
 @dataclass
@@ -518,11 +488,9 @@ class WindowBatcher:
                     _finalize_slot(slot)
                     changed += 1
                     logger.info(
-                        "Slot %d finalized at timeout "
-                        "(accepted=%d, kept=%d, class1=%d, class0=%d)",
+                        "Slot %d finalized at timeout (accepted=%d, class1=%d, class0=%d)",
                         slot.slot_index,
                         slot.count,
-                        sum(1 for c in slot.accepted_completions if c.kept),
                         len(slot.accepted_by_reward.get(1.0, [])),
                         len(slot.accepted_by_reward.get(0.0, [])),
                     )
@@ -553,16 +521,15 @@ class WindowBatcher:
         )
 
     def get_miner_scores(self) -> dict[str, float]:
-        """Return ``{hotkey: cumulative |z-score| across all KEPT completions}``.
+        """Return ``{hotkey: cumulative |z-score| across all accepted completions}``.
 
-        Layering:
-          * Finalize (Phase 1) marks the balanced subset as ``kept=True``.
-          * Advantage scoring (Phase 2) is applied to kept completions only.
-
-        For a class-balanced kept subset the advantage math produces
-        uniform |adv|=1.0 per completion, equivalent to a flat per-kept
-        payout. For a dégénéré slot (one class only → kept stays empty or
-        with std=0) the slot contributes zero to every miner.
+        Uses the per-slot advantage formula on the full accepted set.
+        Happy path (both quotas at 64/64 → auto-finalize): mean=0.5,
+        std=0.5, |adv|=1.0 uniformly → miners paid flat per completion.
+        Imbalanced timeout (e.g., 50 corrects + 20 wrongs): rare class
+        earns more |z-score| per completion, common class earns less —
+        everyone accepted gets paid, proportional to information value.
+        Dégénéré (one class only): std=0 → everyone scores 0, slot burns.
         """
         scores: dict[str, float] = {}
         for slot in self.slots:
@@ -571,21 +538,23 @@ class WindowBatcher:
                 scores[hk] = scores.get(hk, 0.0) + contrib
         return scores
 
-    def get_burn_count(self) -> int:
-        """Return the number of un-used slot "seats" across the window.
+    def get_burn_score(self) -> float:
+        """Return the share of the window's notional budget that burns.
 
-        Budget per window = ``PROMPTS_PER_WINDOW * GROUP_SIZE`` (1024 seats
-        with the default 8 × 128 config). Kept completions consume seats;
-        everything else (accepted-but-not-kept, and slots that never
-        reached both classes) contributes to the burn count, which the
-        validator routes to UID_BURN at weight submission time.
+        Notional budget per window = ``PROMPTS_PER_WINDOW * GROUP_SIZE``
+        "information units" (1024 with the default 8 × 128 config — the
+        amount of |adv| that a fully-balanced window would emit).
+
+        Burn = notional − total miner signal. A fully-balanced window
+        hits the notional and burns 0; a partially-imbalanced window
+        emits less signal and burns the deficit; windows with several
+        dégénéré slots burn most of their budget.
+
+        The validator routes this float to ``UID_BURN`` at weight time.
         """
-        total_budget = PROMPTS_PER_WINDOW * GROUP_SIZE
-        kept = sum(
-            sum(1 for c in slot.accepted_completions if c.kept)
-            for slot in self.slots
-        )
-        return total_budget - kept
+        notional = float(PROMPTS_PER_WINDOW * GROUP_SIZE)
+        miner_total = sum(self.get_miner_scores().values())
+        return max(0.0, notional - miner_total)
 
     def get_archive_data(self) -> dict:
         """Return the full dataset bundle for this window, suitable for S3 upload.
