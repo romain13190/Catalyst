@@ -18,7 +18,7 @@ async def get_subtensor():
     """Create async subtensor."""
     import bittensor as bt
 
-    subtensor = bt.async_subtensor(network=NETWORK)
+    subtensor = bt.AsyncSubtensor(network=NETWORK)
     await asyncio.wait_for(subtensor.initialize(), timeout=120.0)
     return subtensor
 
