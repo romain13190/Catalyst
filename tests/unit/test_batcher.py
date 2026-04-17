@@ -312,6 +312,65 @@ class TestRejectionCases:
         # Hotkey must NOT be consumed — miner can retry.
         assert "miner_A" not in batcher.slots[0].submitted_hotkeys
 
+    def test_cross_miner_duplicate_prefix_rejected(self) -> None:
+        """Second miner reusing the first miner's prefixes → duplicate_prefix.
+
+        This is the sybil-copy block: a second hotkey can't claim emission
+        credit by submitting the same answer (or any answer with the same
+        first-N generated tokens) as someone already in the slot.
+        """
+        batcher = make_batcher()
+        # First miner: default prefixes, accepted.
+        first = batcher.accept_submission(make_request(hotkey="miner_A"))
+        assert first.accepted is True
+        assert len(batcher.slots[0].accepted_prefixes) == COMPLETIONS_PER_SUBMISSION
+
+        # Second miner with a different hotkey but the SAME prefixes.
+        second = batcher.accept_submission(make_request(hotkey="miner_B"))
+        assert second.accepted is False
+        assert second.reason == "duplicate_prefix"
+        # Slot count unchanged; hotkey NOT consumed (miner_B can retry).
+        assert batcher.slots[0].count == COMPLETIONS_PER_SUBMISSION
+        assert "miner_B" not in batcher.slots[0].submitted_hotkeys
+
+    def test_cross_miner_partial_overlap_rejects_whole_batch(self) -> None:
+        """One overlapping prefix in a batch of 4 → whole batch rejected.
+
+        Same all-or-nothing semantics as the proof verification: if any
+        completion collides with the slot's history, the miner doesn't get
+        credit for the other three either.
+        """
+        batcher = make_batcher()
+        first = batcher.accept_submission(make_request(hotkey="miner_A"))
+        assert first.accepted is True
+
+        # Build a batch where prefix #2 collides with miner_A's prefix #2,
+        # but #0, #1, #3 are fresh.
+        partial = [
+            [500, 501, 502, 503, 504, 505, 506, 507],   # fresh
+            [600, 601, 602, 603, 604, 605, 606, 607],   # fresh
+            _DIVERSE_STARTS[2],                          # collides
+            [700, 701, 702, 703, 704, 705, 706, 707],   # fresh
+        ]
+        resp = batcher.accept_submission(
+            make_request(hotkey="miner_B", completions=make_completions(diverse_starts=partial))
+        )
+        assert resp.accepted is False
+        assert resp.reason == "duplicate_prefix"
+        assert batcher.slots[0].count == COMPLETIONS_PER_SUBMISSION
+
+    def test_accepted_prefixes_tracked_per_slot(self) -> None:
+        """A successful accept extends slot.accepted_prefixes by exactly 4 entries."""
+        batcher = make_batcher()
+        assert batcher.slots[0].accepted_prefixes == set()
+
+        batcher.accept_submission(make_request(hotkey="miner_A"))
+        assert len(batcher.slots[0].accepted_prefixes) == COMPLETIONS_PER_SUBMISSION
+
+        # Other slots untouched.
+        for s in batcher.slots[1:]:
+            assert s.accepted_prefixes == set()
+
     def test_token_mismatch_between_top_and_commit_rejected(self) -> None:
         """c.tokens != c.commit['tokens'] → token_mismatch."""
         batcher = make_batcher()

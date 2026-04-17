@@ -82,6 +82,13 @@ class ProblemSlot:
     problem: dict  # from env.get_problem(idx)
     accepted_completions: list[AcceptedCompletion] = field(default_factory=list)
     submitted_hotkeys: set[str] = field(default_factory=set)
+    # Set of token tuples, one per accepted completion, covering the first
+    # DIVERSITY_PREFIX_LEN generated tokens. Used for cross-miner dedup —
+    # any new completion whose prefix lands in this set is rejected. Keeps
+    # the dataset diverse and blocks the trivial sybil-copy attack
+    # (multiple hotkeys submitting bit-identical or trivially-perturbed
+    # answers to claim multiple emission shares for the same work).
+    accepted_prefixes: set[tuple[int, ...]] = field(default_factory=set)
 
     @property
     def count(self) -> int:
@@ -201,11 +208,23 @@ class WindowBatcher:
         if len(request.completions) != COMPLETIONS_PER_SUBMISSION:
             return self._reject("wrong_count", slot_count=slot.count)
 
-        # 7. Diversity: extract prefix from each completion and check pairwise.
+        # 7. Diversity: extract the prefix from each completion. The prefixes
+        # must be pairwise distinct within the batch AND distinct from every
+        # prefix already accepted in this slot (cross-miner dedup).
         prompt_length = self._get_prompt_length(request.completions)
         token_lists = [c.tokens for c in request.completions]
-        if not _prefixes_distinct(token_lists, prompt_length, DIVERSITY_PREFIX_LEN):
+        candidate_prefixes: list[tuple[int, ...]] = []
+        for tokens in token_lists:
+            end = prompt_length + DIVERSITY_PREFIX_LEN
+            if len(tokens) < end:
+                return self._reject("diversity_violation", slot_count=slot.count)
+            candidate_prefixes.append(tuple(tokens[prompt_length:end]))
+
+        if len(set(candidate_prefixes)) != len(candidate_prefixes):
             return self._reject("diversity_violation", slot_count=slot.count)
+
+        if slot.accepted_prefixes.intersection(candidate_prefixes):
+            return self._reject("duplicate_prefix", slot_count=slot.count)
 
         # 8. Per-completion verification.
         expected_prompt_tokens = self.tokenizer.encode(
@@ -239,6 +258,7 @@ class WindowBatcher:
         # 9. All passed — commit atomically.
         slot.accepted_completions.extend(verified)
         slot.submitted_hotkeys.add(request.miner_hotkey)
+        slot.accepted_prefixes.update(candidate_prefixes)
 
         logger.debug(
             "Accepted submission from %s for slot %d (count=%d, settled=%s)",
