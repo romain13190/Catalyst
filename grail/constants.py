@@ -48,8 +48,12 @@ ATTN_IMPLEMENTATION = "flash_attention_2"
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
 
-# Blocks per window. All roles use this to determine window boundaries.
-WINDOW_LENGTH = 30
+# Blocks per window — 5 blocks × 12s ≈ 60s matches SLOT_DEADLINE_SECONDS.
+# All roles use this to determine window boundaries. With
+# WEIGHT_SUBMISSION_INTERVAL=360, that yields ROLLING_WINDOWS=72 windows of
+# scoring per on-chain weight submission, providing ~72× smoothing of miner
+# scores over the epoch.
+WINDOW_LENGTH = 5
 
 # Bittensor block time target average (seconds).
 BLOCK_TIME_SECONDS = 12

@@ -54,17 +54,26 @@ def _make_service(**kwargs) -> ValidationService:
 
 
 class TestComputeTargetWindow:
-    def test_block_95(self):
-        # 95 // 30 = 3, 3*30 = 90, 90 - 30 = 60
-        assert ValidationService._compute_target_window(95) == 60
+    """``target = (block // WINDOW_LENGTH) * WINDOW_LENGTH - WINDOW_LENGTH``.
 
-    def test_block_119(self):
-        # 119 // 30 = 3, 3*30 = 90, 90 - 30 = 60
-        assert ValidationService._compute_target_window(119) == 60
+    Parametrised on the current ``WINDOW_LENGTH`` so the assertions stay
+    correct whether the constant is 5 or 30.
+    """
 
-    def test_block_120(self):
-        # 120 // 30 = 4, 4*30 = 120, 120 - 30 = 90
-        assert ValidationService._compute_target_window(120) == 90
+    def test_block_just_after_window_start(self) -> None:
+        wl = WINDOW_LENGTH
+        block = wl * 3 + 1
+        assert ValidationService._compute_target_window(block) == wl * 2
+
+    def test_block_one_before_next_window(self) -> None:
+        wl = WINDOW_LENGTH
+        block = wl * 4 - 1
+        assert ValidationService._compute_target_window(block) == wl * 2
+
+    def test_block_at_exact_window_boundary(self) -> None:
+        wl = WINDOW_LENGTH
+        block = wl * 4
+        assert ValidationService._compute_target_window(block) == wl * 3
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +197,8 @@ class TestSubmitWeightsSkipsWhenAllZero:
     async def test_set_weights_not_called_when_all_zero(self):
         svc = _make_service()
         svc._miner_scores = defaultdict(float, {"a": 0.0})
+        # No burn either — nothing to emit at all.
+        svc._burn_accumulated = 0.0
 
         meta = MagicMock()
         meta.hotkeys = ["a"]
@@ -203,3 +214,138 @@ class TestSubmitWeightsSkipsWhenAllZero:
             await svc._submit_weights(subtensor)
 
         set_weights_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 6. _submit_weights routes burn to UID_BURN
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitWeightsBurnRouting:
+    @pytest.mark.asyncio
+    async def test_burn_weight_sent_to_uid_zero(self):
+        """Burn share must land in the uids list paired with UID_BURN."""
+        from grail.constants import UID_BURN
+
+        svc = _make_service()
+        svc._miner_scores = defaultdict(float, {"a": 100.0})
+        svc._burn_accumulated = 100.0  # 50% of budget would burn with exp=1
+
+        meta = MagicMock()
+        meta.hotkeys = ["a"]
+        meta.uids = [1]
+
+        set_weights_mock = AsyncMock()
+        subtensor = MagicMock()
+
+        with (
+            patch("grail.validator.service.chain.get_metagraph", new=AsyncMock(return_value=meta)),
+            patch("grail.validator.service.chain.set_weights", new=set_weights_mock),
+        ):
+            await svc._submit_weights(subtensor)
+
+        set_weights_mock.assert_called_once()
+        call_args = set_weights_mock.call_args
+        submitted_uids = call_args.args[3]
+        submitted_weights = call_args.args[4]
+        assert UID_BURN in submitted_uids
+        burn_idx = submitted_uids.index(UID_BURN)
+        # burn_score 100 / (miner_linear 100 + burn 100) = 0.5
+        assert submitted_weights[burn_idx] == pytest.approx(0.5)
+        # Total (miners + burn) sums to 1.0
+        assert sum(submitted_weights) == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_full_burn_when_all_miners_zero(self):
+        """All miner scores 0 but burn > 0 → entire emission to UID_BURN."""
+        from grail.constants import UID_BURN
+
+        svc = _make_service()
+        svc._miner_scores = defaultdict(float, {"a": 0.0, "b": 0.0})
+        svc._burn_accumulated = 500.0
+
+        meta = MagicMock()
+        meta.hotkeys = ["a", "b"]
+        meta.uids = [1, 2]
+
+        set_weights_mock = AsyncMock()
+        subtensor = MagicMock()
+
+        with (
+            patch("grail.validator.service.chain.get_metagraph", new=AsyncMock(return_value=meta)),
+            patch("grail.validator.service.chain.set_weights", new=set_weights_mock),
+        ):
+            await svc._submit_weights(subtensor)
+
+        submitted_uids = set_weights_mock.call_args.args[3]
+        submitted_weights = set_weights_mock.call_args.args[4]
+        assert submitted_uids == [UID_BURN]
+        assert submitted_weights == [pytest.approx(1.0)]
+
+    @pytest.mark.asyncio
+    async def test_no_burn_entry_when_burn_zero(self):
+        """Burn == 0 → UID_BURN absent from submission (cleaner on-chain diff)."""
+        from grail.constants import UID_BURN
+
+        svc = _make_service()
+        svc._miner_scores = defaultdict(float, {"a": 10.0})
+        svc._burn_accumulated = 0.0
+
+        meta = MagicMock()
+        meta.hotkeys = ["a"]
+        meta.uids = [1]
+
+        set_weights_mock = AsyncMock()
+        subtensor = MagicMock()
+
+        with (
+            patch("grail.validator.service.chain.get_metagraph", new=AsyncMock(return_value=meta)),
+            patch("grail.validator.service.chain.set_weights", new=set_weights_mock),
+        ):
+            await svc._submit_weights(subtensor)
+
+        submitted_uids = set_weights_mock.call_args.args[3]
+        assert UID_BURN not in submitted_uids
+
+
+# ---------------------------------------------------------------------------
+# 7. _run_window calls finalize_due_slots and accumulates burn
+# ---------------------------------------------------------------------------
+
+
+class TestRunWindowFinalizesAndAccumulatesBurn:
+    @pytest.mark.asyncio
+    async def test_finalize_due_slots_called_and_burn_accumulated(self):
+        """Verify the window loop polls finalize + accumulates get_burn_score."""
+        svc = _make_service()
+
+        fake_batcher = MagicMock()
+        fake_batcher.is_window_complete = MagicMock(
+            side_effect=[False, True]  # one poll, then complete
+        )
+        fake_batcher.finalize_due_slots = MagicMock(return_value=0)
+        fake_batcher.get_miner_scores = MagicMock(return_value={"m": 20.0})
+        fake_batcher.get_burn_score = MagicMock(return_value=7.5)
+        fake_batcher.get_archive_data = MagicMock(return_value={"slots": []})
+
+        subtensor = MagicMock()
+
+        with (
+            patch("grail.validator.service.chain.get_block_hash",
+                  new=AsyncMock(return_value="deadbeef")),
+            patch("grail.validator.service.derive_window_prompts", return_value=[
+                {"id": f"p{i}", "prompt": f"q{i}", "ground_truth": "1"}
+                for i in range(8)
+            ]),
+            patch("grail.validator.service.WindowBatcher", return_value=fake_batcher),
+            patch("grail.validator.service.storage.upload_window_dataset",
+                  new=AsyncMock(return_value=True)),
+        ):
+            await svc._run_window(subtensor, 60)
+
+        # finalize_due_slots is called at least once in the polling loop + once
+        # as the safety net after the deadline breaks out.
+        assert fake_batcher.finalize_due_slots.call_count >= 2
+        # Burn accumulated into the service's running total.
+        assert svc._burn_accumulated == pytest.approx(7.5)
+        assert svc._miner_scores["m"] == pytest.approx(20.0)

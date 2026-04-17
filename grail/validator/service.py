@@ -12,6 +12,8 @@ from grail.constants import (
     BLOCK_TIME_SECONDS,
     POLL_INTERVAL_SECONDS,
     PROMPTS_PER_WINDOW,
+    SLOT_DEADLINE_SECONDS,
+    UID_BURN,
     VALIDATOR_HTTP_PORT,
     WEIGHT_SUBMISSION_INTERVAL,
     WINDOW_LENGTH,
@@ -25,7 +27,7 @@ from grail.validator.weights import compute_weights
 
 logger = logging.getLogger(__name__)
 
-ROLLING_WINDOWS = WEIGHT_SUBMISSION_INTERVAL // WINDOW_LENGTH  # 12
+ROLLING_WINDOWS = WEIGHT_SUBMISSION_INTERVAL // WINDOW_LENGTH
 
 
 class ValidationService:
@@ -50,6 +52,7 @@ class ValidationService:
 
         self._last_processed_window: int = -1
         self._miner_scores: defaultdict[str, float] = defaultdict(float)
+        self._burn_accumulated: float = 0.0
         self._windows_in_interval: int = 0
 
         self.server = ValidatorServer(host=http_host, port=http_port)
@@ -57,8 +60,9 @@ class ValidationService:
     async def run(self, subtensor) -> None:
         await self.server.start()
         logger.info(
-            "Validator started: env=%s, netuid=%d, http=%s:%d",
+            "Validator started: env=%s, netuid=%d, http=%s:%d, rolling_windows=%d",
             self.env.name, self.netuid, self.server.host, self.server.port,
+            ROLLING_WINDOWS,
         )
         try:
             while True:
@@ -74,6 +78,7 @@ class ValidationService:
                     if self._windows_in_interval >= ROLLING_WINDOWS:
                         await self._submit_weights(subtensor)
                         self._miner_scores.clear()
+                        self._burn_accumulated = 0.0
                         self._windows_in_interval = 0
                 except asyncio.CancelledError:
                     raise
@@ -103,14 +108,29 @@ class ValidationService:
         deadline = time.monotonic() + WINDOW_LENGTH * BLOCK_TIME_SECONDS
         try:
             while time.monotonic() < deadline:
+                # Trigger per-slot timeouts so the SLOT_DEADLINE_SECONDS cap
+                # is actually enforced (slots freeze at 60s regardless of the
+                # enclosing window deadline).
+                batcher.finalize_due_slots()
                 if batcher.is_window_complete():
-                    logger.info("Window %d settled early", target_window)
+                    logger.info("Window %d settled (all slots finalized)", target_window)
                     break
                 await asyncio.sleep(1)
 
+            # Safety net: force-finalize anything still open. Needed when the
+            # window deadline fires before the SLOT deadline (small WINDOW_LENGTH)
+            # or when the slot clock and service clock have drifted.
+            batcher.finalize_due_slots(now=time.monotonic() + SLOT_DEADLINE_SECONDS)
+
             scores = batcher.get_miner_scores()
+            burn = batcher.get_burn_score()
             for hk, s in scores.items():
                 self._miner_scores[hk] += s
+            self._burn_accumulated += burn
+            logger.info(
+                "Window %d scored: %d miners (total %.2f), burn %.2f",
+                target_window, len(scores), sum(scores.values()), burn,
+            )
 
             archive = batcher.get_archive_data()
             try:
@@ -136,20 +156,29 @@ class ValidationService:
 
     async def _submit_weights(self, subtensor) -> None:
         scores = dict(self._miner_scores)
-        weights = compute_weights(scores)
-        non_zero = {hk: w for hk, w in weights.items() if w > 0}
-        logger.info("Submitting weights for %d miners", len(non_zero))
-        for hk, w in sorted(non_zero.items(), key=lambda x: -x[1])[:10]:
+        burn = self._burn_accumulated
+        miner_weights, burn_weight = compute_weights(scores, burn_score=burn)
+        non_zero_miners = {hk: w for hk, w in miner_weights.items() if w > 0}
+        logger.info(
+            "Submitting weights: %d miners + %.4f burn to UID %d "
+            "(miner_total=%.2f, burn_score=%.2f)",
+            len(non_zero_miners), burn_weight, UID_BURN,
+            sum(scores.values()), burn,
+        )
+        for hk, w in sorted(non_zero_miners.items(), key=lambda x: -x[1])[:10]:
             logger.info("  %s: %.6f", hk[:8], w)
 
         meta = await chain.get_metagraph(subtensor, self.netuid)
         hotkey_to_uid = dict(zip(meta.hotkeys, meta.uids))
-        uids = []
-        weight_vals = []
-        for hk, w in weights.items():
+        uids: list[int] = []
+        weight_vals: list[float] = []
+        for hk, w in miner_weights.items():
             if hk in hotkey_to_uid and w > 0:
                 uids.append(int(hotkey_to_uid[hk]))
                 weight_vals.append(w)
+        if burn_weight > 0:
+            uids.append(UID_BURN)
+            weight_vals.append(burn_weight)
         if uids:
             await chain.set_weights(
                 subtensor, self.wallet, self.netuid, uids, weight_vals,
