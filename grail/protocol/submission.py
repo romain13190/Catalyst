@@ -23,7 +23,7 @@ class CompletionSubmission(BaseModel):
 
 
 class SubmissionRequest(BaseModel):
-    """A miner's batch of `COMPLETIONS_PER_SUBMISSION` completions for one slot."""
+    """A miner's batch of 1..COMPLETIONS_PER_SUBMISSION completions for one slot."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -35,13 +35,13 @@ class SubmissionRequest(BaseModel):
 
     @field_validator("completions")
     @classmethod
-    def _exact_completion_count(
+    def _completion_count_within_plafond(
         cls, v: list[CompletionSubmission]
     ) -> list[CompletionSubmission]:
-        if len(v) != COMPLETIONS_PER_SUBMISSION:
+        if len(v) < 1 or len(v) > COMPLETIONS_PER_SUBMISSION:
             raise ValueError(
-                f"completions must have exactly {COMPLETIONS_PER_SUBMISSION} entries, "
-                f"got {len(v)}"
+                f"completions must have between 1 and {COMPLETIONS_PER_SUBMISSION} "
+                f"entries, got {len(v)}"
             )
         return v
 

@@ -126,7 +126,7 @@ def test_window_state_returns_batcher_snapshot(
 
 def test_submit_validates_payload_shape(client: TestClient) -> None:
     bad = _payload()
-    bad["completions"] = bad["completions"][:2]  # only 2 instead of 4
+    bad["completions"] = []  # empty list rejected by pydantic min_length
     fake_batcher = MagicMock()
     fake_batcher.window_start = 1000
     # Even with active batcher, pydantic should reject before reaching it.

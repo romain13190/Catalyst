@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from grail.constants import COMPLETIONS_PER_SUBMISSION, PROMPTS_PER_WINDOW
+from grail.constants import MINER_BATCH_SIZE, PROMPTS_PER_WINDOW, GROUP_SIZE
 from grail.protocol.submission import (
     CompletionSubmission,
     SlotState,
@@ -157,7 +157,7 @@ async def test_mine_window_skips_settled_slots():
         {"tokens": [10, 20, 30, 40, 50, i, 0, 0, 0],
          "prompt_length": 5,
          "completion_tokens": [i, 0, 0, 0]}
-        for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
+        for i in range(1, MINER_BATCH_SIZE + 1)
     ]
     engine._generate_targeted_batch = MagicMock(return_value=diverse)
 
@@ -200,7 +200,7 @@ async def test_mine_window_stops_at_deadline():
         {"tokens": [10, 20, 30, 40, 50, i, 0, 0, 0],
          "prompt_length": 5,
          "completion_tokens": [i, 0, 0, 0]}
-        for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
+        for i in range(1, MINER_BATCH_SIZE + 1)
     ]
     engine._generate_targeted_batch = MagicMock(return_value=diverse)
 
@@ -273,7 +273,6 @@ async def test_mine_window_skips_slot_when_diverse_batch_fails():
 # ---------------------------------------------------------------------------
 
 
-from grail.constants import COMPLETIONS_PER_CLASS
 from grail.miner.engine import MiningEngine
 
 
@@ -287,22 +286,22 @@ class TestChooseTargetReward:
     def test_imbalanced_picks_rare_class(self) -> None:
         # count_1=20, count_0=5 → 0.0 is rarer
         assert MiningEngine._choose_target_reward({"1.0": 20, "0.0": 5}) == 0.0
-        # count_1=5, count_0=20 → 1.0 is rarer
-        assert MiningEngine._choose_target_reward({"1.0": 5, "0.0": 20}) == 1.0
+        # count_1=5, count_0=12 → 1.0 is rarer
+        assert MiningEngine._choose_target_reward({"1.0": 5, "0.0": 12}) == 1.0
 
-    def test_picks_other_class_when_one_full(self) -> None:
-        # class 1.0 has no room left → must pick 0.0
-        almost = COMPLETIONS_PER_CLASS - 3  # only 3 left, can't fit a batch of 4
+    def test_slot_at_group_size_returns_sentinel(self) -> None:
+        # Total counts == GROUP_SIZE → sentinel so caller skips the slot.
         assert (
-            MiningEngine._choose_target_reward({"1.0": almost, "0.0": 10}) == 0.0
+            MiningEngine._choose_target_reward(
+                {"1.0": GROUP_SIZE // 2, "0.0": GROUP_SIZE // 2}
+            )
+            == "slot_full"
         )
 
-    def test_both_near_full_returns_sentinel(self) -> None:
-        almost = COMPLETIONS_PER_CLASS - 3
-        assert (
-            MiningEngine._choose_target_reward({"1.0": almost, "0.0": almost})
-            == "both_full"
-        )
+    def test_rare_class_still_chosen_when_plenty_of_room(self) -> None:
+        # Even if one class has most completions, as long as total < GROUP_SIZE
+        # the miner should target the rare class.
+        assert MiningEngine._choose_target_reward({"1.0": 20, "0.0": 8}) == 0.0
 
 
 class TestGenerateTargetedBatch:
@@ -332,7 +331,7 @@ class TestGenerateTargetedBatch:
         engine = self._build_engine_with_env_rewards([0.0] * 10)
         problem = {"prompt": "Q", "ground_truth": "42", "id": "p"}
         batch = engine._generate_targeted_batch(problem, "ab" * 32, target_reward=None)
-        assert len(batch) == COMPLETIONS_PER_SUBMISSION
+        assert len(batch) == MINER_BATCH_SIZE
         # Should NOT have called compute_reward when target is None
         engine.env.compute_reward.assert_not_called()
 
@@ -341,7 +340,7 @@ class TestGenerateTargetedBatch:
         engine = self._build_engine_with_env_rewards([0.0, 1.0] * 20)
         problem = {"prompt": "Q", "ground_truth": "42", "id": "p"}
         batch = engine._generate_targeted_batch(problem, "ab" * 32, target_reward=1.0)
-        assert len(batch) == COMPLETIONS_PER_SUBMISSION
+        assert len(batch) == MINER_BATCH_SIZE
         # Needed at least 8 attempts (4 rejected + 4 kept).
         assert engine.vllm_model.generate.call_count >= 8
 
@@ -351,8 +350,8 @@ class TestGenerateTargetedBatch:
         problem = {"prompt": "Q", "ground_truth": "42", "id": "p"}
         batch = engine._generate_targeted_batch(problem, "ab" * 32, target_reward=1.0)
         assert batch == []
-        # Cap is COMPLETIONS_PER_SUBMISSION * 10 = 40
-        assert engine.vllm_model.generate.call_count == COMPLETIONS_PER_SUBMISSION * 10
+        # Cap is MINER_BATCH_SIZE * 10 = 40
+        assert engine.vllm_model.generate.call_count == MINER_BATCH_SIZE * 10
 
 
 class TestMinerUsesRewardsHistogram:
@@ -368,20 +367,21 @@ class TestMinerUsesRewardsHistogram:
             {"tokens": [10, 20, 30, 40, 50, i, 0, 0, 0],
              "prompt_length": 5,
              "completion_tokens": [i, 0, 0, 0]}
-            for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
+            for i in range(1, MINER_BATCH_SIZE + 1)
         ]
         engine._generate_targeted_batch = MagicMock(return_value=diverse)
 
-        # Slot 0 imbalanced: 40 corrects vs 10 wrongs → miner should target 0.0
+        # Slot 0 imbalanced: 20 corrects vs 5 wrongs (total 25 < GROUP_SIZE)
+        # → miner should target 0.0 as rare class.
         state = WindowStateResponse(
             window_start=1000,
             slot_states=[
                 SlotState(
                     slot_index=i,
                     prompt_id=f"id-{i:04d}",
-                    count=50 if i == 0 else 0,
+                    count=25 if i == 0 else 0,
                     settled=False,
-                    rewards={"1.0": 40, "0.0": 10} if i == 0 else {},
+                    rewards={"1.0": 20, "0.0": 5} if i == 0 else {},
                 )
                 for i in range(PROMPTS_PER_WINDOW)
             ],
@@ -404,25 +404,25 @@ class TestMinerUsesRewardsHistogram:
         assert first_call.args[2] == 0.0  # target_reward kwarg
 
     @pytest.mark.asyncio
-    async def test_both_quotas_near_full_skips_slot(self) -> None:
-        """Both quotas have < 4 remaining → slot is skipped, no generate, no submit."""
+    async def test_full_slot_skipped(self) -> None:
+        """Slot already at GROUP_SIZE → skipped, no generate, no submit."""
         engine = _make_engine(validator_url_override="http://localhost:8888")
         engine._generate_targeted_batch = MagicMock()  # must NOT be called for slot 0
         engine._build_completion_submission = MagicMock(
             return_value=_stub_completion_submission()
         )
 
-        almost = COMPLETIONS_PER_CLASS - 2
         state = WindowStateResponse(
             window_start=1000,
             slot_states=[
                 SlotState(
                     slot_index=i,
                     prompt_id=f"id-{i:04d}",
-                    count=0,
+                    count=GROUP_SIZE if i == 0 else 0,
                     settled=False,
                     rewards=(
-                        {"1.0": almost, "0.0": almost} if i == 0 else {}
+                        {"1.0": GROUP_SIZE // 2, "0.0": GROUP_SIZE // 2}
+                        if i == 0 else {}
                     ),
                 )
                 for i in range(PROMPTS_PER_WINDOW)
@@ -434,7 +434,7 @@ class TestMinerUsesRewardsHistogram:
             {"tokens": [10, 20, 30, 40, 50, i, 0, 0, 0],
              "prompt_length": 5,
              "completion_tokens": [i, 0, 0, 0]}
-            for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
+            for i in range(1, MINER_BATCH_SIZE + 1)
         ]
 
         monotonic_vals = iter([0.0] * 100)
@@ -466,7 +466,7 @@ async def test_validator_url_override_skips_metagraph_lookup():
         {"tokens": [10, 20, 30, 40, 50, i, 0, 0, 0],
          "prompt_length": 5,
          "completion_tokens": [i, 0, 0, 0]}
-        for i in range(1, COMPLETIONS_PER_SUBMISSION + 1)
+        for i in range(1, MINER_BATCH_SIZE + 1)
     ]
     engine._generate_targeted_batch = MagicMock(return_value=diverse)
 

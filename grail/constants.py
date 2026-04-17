@@ -86,19 +86,25 @@ MAX_TOKENS_PER_ROLLOUT = MAX_NEW_TOKENS_PROTOCOL_CAP + 4096
 # Number of distinct prompts to derive per window from the beacon.
 PROMPTS_PER_WINDOW = 8
 
-# Completions per prompt to collect at the slot cap — 64 per reward class
-# × 2 classes. Balanced 50/50 composition is the information-theoretic
-# optimum for binary-reward GRPO.
-GROUP_SIZE = 128
+# Completions per prompt to collect at the slot cap. When the slot reaches
+# GROUP_SIZE accepted completions, it auto-finalises; no per-class quota is
+# enforced during collection. Advantage scoring (rare-class pays more)
+# provides the incentive for miners to pivot toward the under-represented
+# class, self-balancing the slot without a hard cap. A slot that settles
+# fully one-sided ({GROUP_SIZE, 0}) has std=0 → zero payout → its emission
+# share burns.
+GROUP_SIZE = 32
 
-# Per-reward-class quota inside a slot. Once a class has `COMPLETIONS_PER_CLASS`
-# accepted completions, new submissions with that reward value are rejected
-# ("quota_full"). This guarantees that a slot can never reach a dégénéré
-# (all-one-class) settlement.
-COMPLETIONS_PER_CLASS = 64
+# Maximum completions allowed in a single submission. Equals GROUP_SIZE so
+# one miner can, in theory, fill an entire slot solo — but the cross-miner
+# prefix-dedup and atomic batch-verification make that strategy risky and
+# compute-heavy. In practice miners produce small batches (default 4).
+COMPLETIONS_PER_SUBMISSION = GROUP_SIZE
 
-# Completions a miner submits in one HTTP call (also = max per miner per prompt).
-COMPLETIONS_PER_SUBMISSION = 4
+# Default batch size a miner produces per submission call. Miners may submit
+# any size in [1, COMPLETIONS_PER_SUBMISSION]; this is just the out-of-box
+# default used by the reference MiningEngine.
+MINER_BATCH_SIZE = 4
 
 # First N generated tokens that must be distinct across the 4 completions in a batch.
 DIVERSITY_PREFIX_LEN = 8

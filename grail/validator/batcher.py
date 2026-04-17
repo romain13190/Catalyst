@@ -12,8 +12,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from grail.constants import (
-    COMPLETIONS_PER_CLASS,
-    COMPLETIONS_PER_SUBMISSION,
     DIVERSITY_PREFIX_LEN,
     GROUP_SIZE,
     PROMPTS_PER_WINDOW,
@@ -39,12 +37,14 @@ logger = logging.getLogger(__name__)
 def _finalize_slot(slot: "ProblemSlot") -> None:
     """Freeze the slot — no further submissions accepted from this point.
 
-    Scoring happens separately via ``_compute_slot_scores`` on the
-    accepted completions (balanced or not). The quota layer already caps
-    each reward class at COMPLETIONS_PER_CLASS, so an imbalanced timeout
-    settlement (say 50 corrects + 20 wrongs) naturally pays everyone via
-    advantage scoring: the rare class earns more |z-score| per completion,
-    the common class earns less, dégénéré slots (std=0) pay zero.
+    Scoring happens separately via ``_compute_slot_scores`` on the full
+    accepted set. There is no per-class quota during collection — the slot
+    accepts any valid submission until it reaches GROUP_SIZE or the
+    per-slot deadline fires. Balance is incentivised post-hoc via
+    advantage scoring: rare class earns a higher |z-score| per completion,
+    so rational miners read the histogram and pivot to the under-
+    represented class. Dégénéré slots (std=0, e.g. {32, 0}) pay zero and
+    their notional share burns.
 
     Idempotent.
     """
@@ -150,10 +150,6 @@ class ProblemSlot:
     # Set of token tuples, one per accepted completion, covering the first
     # DIVERSITY_PREFIX_LEN generated tokens. Used for cross-miner dedup.
     accepted_prefixes: set[tuple[int, ...]] = field(default_factory=set)
-    # {reward_value: [indices into accepted_completions in arrival order]}.
-    # Used by _finalize_slot to mark the first COMPLETIONS_PER_CLASS of
-    # each class as kept.
-    accepted_by_reward: dict[float, list[int]] = field(default_factory=dict)
     # Set to True by _finalize_slot — no more submissions accepted after this.
     finalized: bool = False
 
@@ -165,31 +161,15 @@ class ProblemSlot:
     def settled(self) -> bool:
         """Alias for ``finalized`` — kept for API stability.
 
-        A slot is "settled" once its kept subset has been chosen. This
-        happens either because both class quotas are full (happy path)
-        or because the per-slot deadline fired (timeout path).
+        A slot is "settled" once it has been finalised. This happens either
+        because the slot filled to GROUP_SIZE (happy path) or because the
+        per-slot deadline fired (timeout path).
         """
         return self.finalized
 
-    @property
-    def both_quotas_full(self) -> bool:
-        """True when both reward classes have reached COMPLETIONS_PER_CLASS."""
-        got_one = any(
-            len(self.accepted_by_reward.get(r, [])) >= COMPLETIONS_PER_CLASS
-            for r in (1.0, 0.0)
-        )
-        both = all(
-            len(self.accepted_by_reward.get(r, [])) >= COMPLETIONS_PER_CLASS
-            for r in (1.0, 0.0)
-        )
-        # `got_one` is only here so a future non-binary env can override the
-        # quota-full predicate without rewriting this property.
-        del got_one
-        return both
-
-    def quota_remaining(self, reward: float) -> int:
-        """How many more of this reward class can still be accepted."""
-        return COMPLETIONS_PER_CLASS - len(self.accepted_by_reward.get(reward, []))
+    def remaining_capacity(self) -> int:
+        """Number of completions that can still fit in this slot."""
+        return GROUP_SIZE - self.count
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +257,7 @@ class WindowBatcher:
     # ------------------------------------------------------------------
 
     def accept_submission(self, request: SubmissionRequest) -> SubmissionResponse:
-        """Atomic accept-or-reject of all COMPLETIONS_PER_SUBMISSION completions.
+        """Atomic accept-or-reject of a miner's submission batch.
 
         Checks are performed in order; the first failure short-circuits and
         returns a SubmissionResponse with ``accepted=False`` and a stable
@@ -285,9 +265,9 @@ class WindowBatcher:
         the miner may retry with a corrected batch.
 
         On full success all completions are appended to the slot and the
-        hotkey is added to ``submitted_hotkeys``. Once both reward classes
-        hit their COMPLETIONS_PER_CLASS quota, the slot auto-finalises and
-        no further submissions are accepted.
+        hotkey is added to ``submitted_hotkeys``. When the slot reaches
+        GROUP_SIZE accepted completions, it auto-finalises and no further
+        submissions are accepted.
         """
         with self._lock:
             return self._accept_submission_locked(request)
@@ -317,9 +297,12 @@ class WindowBatcher:
         if request.prompt_id != slot.prompt_id:
             return self._reject("prompt_mismatch", slot_count=slot.count)
 
-        # 6. Completion count (defence-in-depth; Pydantic enforces this too).
-        if len(request.completions) != COMPLETIONS_PER_SUBMISSION:
-            return self._reject("wrong_count", slot_count=slot.count)
+        # 6. Capacity guard: the batch must fit in the slot's remaining room.
+        # Pydantic already bounds len(completions) to [1, GROUP_SIZE] (via
+        # COMPLETIONS_PER_SUBMISSION); here we reject if accepting the batch
+        # would overflow the slot's residual capacity.
+        if slot.count + len(request.completions) > GROUP_SIZE:
+            return self._reject("slot_full", slot_count=slot.count)
 
         # 7. Diversity: extract the prefix from each completion. The prefixes
         # must be pairwise distinct within the batch AND distinct from every
@@ -368,35 +351,24 @@ class WindowBatcher:
                 )
             )
 
-        # 9. Per-reward-class quota check — enforces the 64/64 composition
-        # target. If any class in the batch would push past its quota, the
-        # WHOLE batch is rejected (miner retries with an adjusted mix).
-        batch_by_reward: dict[float, int] = {}
-        for c in verified:
-            batch_by_reward[c.reward] = batch_by_reward.get(c.reward, 0) + 1
-        for reward, n in batch_by_reward.items():
-            if slot.quota_remaining(reward) < n:
-                return self._reject("quota_full", slot_count=slot.count)
-
-        # 10. All passed — commit atomically.
+        # 9. All passed — commit atomically.
         now = self._time_fn()
         for c in verified:
             c.arrived_at = now
             slot.accepted_completions.append(c)
-            idx = len(slot.accepted_completions) - 1
-            slot.accepted_by_reward.setdefault(c.reward, []).append(idx)
         slot.submitted_hotkeys.add(request.miner_hotkey)
         slot.accepted_prefixes.update(candidate_prefixes)
 
-        # 11. Auto-finalize on happy path: both quotas are full → the
-        # balanced subset is 64+64 = 128 kept, equal arrival-order or not.
-        if slot.both_quotas_full:
+        # 10. Auto-finalize on happy path: slot reached GROUP_SIZE accepted
+        # completions. No per-class quota is enforced; advantage scoring
+        # handles whatever composition emerges.
+        if slot.count >= GROUP_SIZE:
             _finalize_slot(slot)
             logger.info(
-                "Slot %d auto-finalized at %d/%d quotas full",
+                "Slot %d auto-finalized at %d/%d accepted",
                 slot.slot_index,
-                len(slot.accepted_by_reward.get(1.0, [])),
-                len(slot.accepted_by_reward.get(0.0, [])),
+                slot.count,
+                GROUP_SIZE,
             )
 
         logger.debug(
@@ -487,12 +459,12 @@ class WindowBatcher:
                 if not slot.finalized:
                     _finalize_slot(slot)
                     changed += 1
+                    hist = _reward_histogram(slot)
                     logger.info(
-                        "Slot %d finalized at timeout (accepted=%d, class1=%d, class0=%d)",
+                        "Slot %d finalized at timeout (accepted=%d, histogram=%s)",
                         slot.slot_index,
                         slot.count,
-                        len(slot.accepted_by_reward.get(1.0, [])),
-                        len(slot.accepted_by_reward.get(0.0, [])),
+                        hist,
                     )
             return changed
 
@@ -500,9 +472,10 @@ class WindowBatcher:
         """Return a snapshot of all slot states for the HTTP /window/{n}/state endpoint.
 
         Each slot includes the histogram of accepted-completion rewards so
-        miners can compute quota_remaining per class and target the rare
-        one. The histogram reflects accepted (pre-finalize) counts; finalize
-        doesn't change it, only marks which accepted items are kept.
+        miners can read the distribution and target the under-represented
+        class for higher |advantage| payout. The histogram reflects the
+        accepted set; finalize doesn't change the counts, only prevents
+        new submissions.
         """
         with self._lock:
             slot_states = [
@@ -524,12 +497,13 @@ class WindowBatcher:
         """Return ``{hotkey: cumulative |z-score| across all accepted completions}``.
 
         Uses the per-slot advantage formula on the full accepted set.
-        Happy path (both quotas at 64/64 → auto-finalize): mean=0.5,
-        std=0.5, |adv|=1.0 uniformly → miners paid flat per completion.
-        Imbalanced timeout (e.g., 50 corrects + 20 wrongs): rare class
-        earns more |z-score| per completion, common class earns less —
-        everyone accepted gets paid, proportional to information value.
-        Dégénéré (one class only): std=0 → everyone scores 0, slot burns.
+        Balanced slot (e.g., 16 corrects + 16 wrongs): mean=0.5, std=0.5,
+        |adv|=1.0 uniformly → miners paid flat per completion.
+        Imbalanced slot (e.g., 20 corrects + 12 wrongs): rare class earns
+        more |z-score| per completion, common class earns less — everyone
+        accepted is paid, proportional to information value.
+        Dégénéré (one class only, e.g. {32, 0}): std=0 → everyone scores 0,
+        slot burns.
         """
         scores: dict[str, float] = {}
         for slot in self.slots:
@@ -542,7 +516,7 @@ class WindowBatcher:
         """Return the share of the window's notional budget that burns.
 
         Notional budget per window = ``PROMPTS_PER_WINDOW * GROUP_SIZE``
-        "information units" (1024 with the default 8 × 128 config — the
+        "information units" (256 with the default 8 × 32 config — the
         amount of |adv| that a fully-balanced window would emit).
 
         Burn = notional − total miner signal. A fully-balanced window

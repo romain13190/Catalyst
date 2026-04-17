@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING
 
 from grail.constants import (
     BLOCK_TIME_SECONDS,
-    COMPLETIONS_PER_CLASS,
-    COMPLETIONS_PER_SUBMISSION,
     DIVERSITY_PREFIX_LEN,
+    GROUP_SIZE,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    MINER_BATCH_SIZE,
     PROMPTS_PER_WINDOW,
     UPLOAD_BUFFER,
     WINDOW_LENGTH,
@@ -140,9 +140,9 @@ class MiningEngine:
                             logger.debug("slot %d already settled, skipping", slot_index)
                             continue
                         target_reward = self._choose_target_reward(slot_state.rewards)
-                        if target_reward == "both_full":
+                        if target_reward == "slot_full":
                             logger.debug(
-                                "slot %d: both quotas near-full, skipping", slot_index,
+                                "slot %d: full, skipping", slot_index,
                             )
                             continue
                 except SubmissionError as exc:
@@ -159,17 +159,17 @@ class MiningEngine:
                     )
                     continue
 
-                # 6c. Generate 4 prefix-distinct completions, targeting the
-                # picked reward class if any (sample-and-filter locally).
+                # 6c. Generate MINER_BATCH_SIZE prefix-distinct completions,
+                # targeting the picked reward class if any (sample-and-filter).
                 diverse = self._generate_targeted_batch(
                     problem, randomness, target_reward,
                 )
-                if len(diverse) < COMPLETIONS_PER_SUBMISSION:
+                if len(diverse) < MINER_BATCH_SIZE:
                     logger.warning(
                         "slot %d: only got %d completions after max attempts "
                         "(target_reward=%s, need %d) — skipping",
                         slot_index, len(diverse), target_reward,
-                        COMPLETIONS_PER_SUBMISSION,
+                        MINER_BATCH_SIZE,
                     )
                     continue
 
@@ -229,30 +229,20 @@ class MiningEngine:
     def _choose_target_reward(rewards_hist: dict[str, int]):
         """Pick the reward class the miner should target for this slot.
 
-        Strategy:
-          * If one class has quota remaining for a full batch of 4 and the
-            other doesn't → produce the class with room.
-          * If both have room → target the RARE one (smaller count) to
-            maximise |advantage| at settlement.
-          * Ties → fall back to None (indifferent; produce whatever the
-            model outputs naturally).
-          * If neither class has room for 4 more → return the sentinel
-            string ``"both_full"`` so the caller skips the slot.
+        Strategy under the market-free settlement (no per-class quota):
+          * If the slot has already reached GROUP_SIZE → return the
+            sentinel ``"slot_full"`` so the caller skips the slot.
+          * Otherwise target the RARE class (smaller count) to maximise
+            |advantage| at settlement. Ties → None (no preference).
 
         Returns:
-            1.0, 0.0, None, or the sentinel ``"both_full"``.
+            1.0, 0.0, None, or the sentinel ``"slot_full"``.
         """
         count_1 = rewards_hist.get("1.0", 0)
         count_0 = rewards_hist.get("0.0", 0)
-        remaining_1 = COMPLETIONS_PER_CLASS - count_1
-        remaining_0 = COMPLETIONS_PER_CLASS - count_0
 
-        if remaining_1 < COMPLETIONS_PER_SUBMISSION and remaining_0 < COMPLETIONS_PER_SUBMISSION:
-            return "both_full"
-        if remaining_1 < COMPLETIONS_PER_SUBMISSION:
-            return 0.0
-        if remaining_0 < COMPLETIONS_PER_SUBMISSION:
-            return 1.0
+        if count_1 + count_0 >= GROUP_SIZE:
+            return "slot_full"
         if count_1 < count_0:
             return 1.0
         if count_0 < count_1:
@@ -265,7 +255,7 @@ class MiningEngine:
         randomness: str,
         target_reward: float | None,
     ) -> list[dict]:
-        """Generate up to COMPLETIONS_PER_SUBMISSION prefix-distinct completions,
+        """Generate up to MINER_BATCH_SIZE prefix-distinct completions,
         optionally filtered to match ``target_reward``.
 
         Uses the env locally to score each candidate (deterministic — same
@@ -280,7 +270,7 @@ class MiningEngine:
         # rejection sampling without blowing up when the model is near-
         # deterministic on this prompt (in which case we give up and let
         # the caller skip the slot).
-        max_attempts = COMPLETIONS_PER_SUBMISSION * 10
+        max_attempts = MINER_BATCH_SIZE * 10
 
         prompt_tokens: list[int] = self.tokenizer.encode(
             problem["prompt"], add_special_tokens=False
@@ -291,7 +281,7 @@ class MiningEngine:
         completions: list[dict] = []
 
         for _ in range(max_attempts):
-            if len(completions) >= COMPLETIONS_PER_SUBMISSION:
+            if len(completions) >= MINER_BATCH_SIZE:
                 break
 
             with torch.no_grad():

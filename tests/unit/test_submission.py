@@ -80,15 +80,30 @@ class TestSubmissionRequest:
         ok = _valid_request_payload() | {"slot_index": PROMPTS_PER_WINDOW - 1}
         assert SubmissionRequest(**ok).slot_index == PROMPTS_PER_WINDOW - 1
 
-    def test_completion_count_too_few(self) -> None:
+    def test_completion_count_empty_rejected(self) -> None:
         bad = _valid_request_payload()
-        bad["completions"] = bad["completions"][:-1]
+        bad["completions"] = []
         with pytest.raises(ValidationError):
             SubmissionRequest(**bad)
 
-    def test_completion_count_too_many(self) -> None:
+    def test_completion_count_one_accepted(self) -> None:
+        ok = _valid_request_payload()
+        ok["completions"] = ok["completions"][:1]
+        assert len(SubmissionRequest(**ok).completions) == 1
+
+    def test_completion_count_under_plafond_accepted(self) -> None:
+        """Any size between 1 and COMPLETIONS_PER_SUBMISSION is valid."""
+        from grail.constants import COMPLETIONS_PER_SUBMISSION
+        ok = _valid_request_payload()
+        extras = [_valid_completion(i) for i in range(10, 10 + COMPLETIONS_PER_SUBMISSION - len(ok["completions"]))]
+        ok["completions"] = ok["completions"] + extras
+        assert len(SubmissionRequest(**ok).completions) == COMPLETIONS_PER_SUBMISSION
+
+    def test_completion_count_over_plafond_rejected(self) -> None:
+        from grail.constants import COMPLETIONS_PER_SUBMISSION
         bad = _valid_request_payload()
-        bad["completions"] = bad["completions"] + [_valid_completion(99)]
+        extras = [_valid_completion(i) for i in range(10, 10 + COMPLETIONS_PER_SUBMISSION)]
+        bad["completions"] = bad["completions"] + extras  # guaranteed > plafond
         with pytest.raises(ValidationError):
             SubmissionRequest(**bad)
 
