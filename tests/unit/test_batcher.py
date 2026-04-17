@@ -7,10 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from grail.constants import (
+    COMPLETIONS_PER_CLASS,
     COMPLETIONS_PER_SUBMISSION,
     DIVERSITY_PREFIX_LEN,
     GROUP_SIZE,
     PROMPTS_PER_WINDOW,
+    SLOT_DEADLINE_SECONDS,
 )
 from grail.validator.batcher import AcceptedCompletion, ProblemSlot, WindowBatcher
 from grail.protocol.submission import SubmissionRequest, CompletionSubmission
@@ -62,11 +64,25 @@ def make_slot(slot_index: int = 0) -> ProblemSlot:
     )
 
 
+class _FakeClock:
+    """Monotonic clock mock — advance() by a delta, now() returns current."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self._t = start
+
+    def __call__(self) -> float:
+        return self._t
+
+    def advance(self, delta: float) -> None:
+        self._t += delta
+
+
 def make_batcher(
     slots: list[ProblemSlot] | None = None,
     verify_commitment_proofs_fn=None,
     verify_signature_fn=None,
     verify_proof_version_fn=None,
+    time_fn=None,
 ) -> WindowBatcher:
     if slots is None:
         slots = [make_slot(i) for i in range(PROMPTS_PER_WINDOW)]
@@ -89,6 +105,7 @@ def make_batcher(
         verify_commitment_proofs_fn=verify_commitment_proofs_fn,
         verify_signature_fn=verify_signature_fn,
         verify_proof_version_fn=verify_proof_version_fn,
+        time_fn=time_fn,
     )
 
 
@@ -176,6 +193,54 @@ def make_request(
     )
 
 
+def _diverse_set(offset: int) -> list[list[int]]:
+    """Build 4 distinct prefixes for one miner's batch, offset to avoid cross-miner collisions."""
+    base = 10_000 + offset * 1000
+    return [
+        [base + i * 10 + j for j in range(8)]
+        for i in range(COMPLETIONS_PER_SUBMISSION)
+    ]
+
+
+def fill_slot_class(
+    batcher: WindowBatcher,
+    slot_index: int,
+    correct: bool,
+    start_miner_idx: int,
+    batch_count: int,
+) -> None:
+    """Submit ``batch_count`` batches (each 4 completions of same class) from
+    sequential hotkeys. Assumes quotas have room."""
+    for i in range(batch_count):
+        m = start_miner_idx + i
+        req = make_request(
+            hotkey=f"miner_{m}",
+            slot_index=slot_index,
+            completions=make_completions(
+                diverse_starts=_diverse_set(m),
+                correct_flags=[correct] * COMPLETIONS_PER_SUBMISSION,
+            ),
+        )
+        resp = batcher.accept_submission(req)
+        assert resp.accepted is True, f"miner_{m} rejected: {resp.reason}"
+
+
+# 16 batches × 4 completions = 64 = COMPLETIONS_PER_CLASS (one full class quota).
+BATCHES_PER_CLASS = COMPLETIONS_PER_CLASS // COMPLETIONS_PER_SUBMISSION
+
+
+def fully_fill_slot(batcher: WindowBatcher, slot_index: int) -> None:
+    """Fill BOTH class quotas of a slot, triggering auto-finalize.
+
+    Uses 16 miners of each class = 32 miners total, all with distinct prefixes.
+    """
+    fill_slot_class(batcher, slot_index, correct=True, start_miner_idx=0, batch_count=BATCHES_PER_CLASS)
+    fill_slot_class(
+        batcher, slot_index, correct=False,
+        start_miner_idx=BATCHES_PER_CLASS, batch_count=BATCHES_PER_CLASS,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -254,37 +319,60 @@ class TestRejectionCases:
         assert resp.reason == "invalid_slot"
 
     def test_settled_slot_rejects_new_submission(self) -> None:
-        """Fill slot to GROUP_SIZE (8 miners × 4 completions each), 9th gets slot_full."""
-        # GROUP_SIZE = 32 = 8 miners × 4 completions
-        assert GROUP_SIZE == 32
+        """Fill both class quotas → slot auto-finalizes → extra submission → slot_full."""
         batcher = make_batcher()
+        fully_fill_slot(batcher, slot_index=0)
 
-        # 8 different miners, each with their own diverse prefixes
-        for miner_idx in range(GROUP_SIZE // COMPLETIONS_PER_SUBMISSION):
-            diverse = [
-                [miner_idx * 100 + i, miner_idx * 100 + i + 1,
-                 miner_idx * 100 + i + 2, miner_idx * 100 + i + 3,
-                 miner_idx * 100 + i + 4, miner_idx * 100 + i + 5,
-                 miner_idx * 100 + i + 6, miner_idx * 100 + i + 7]
-                for i in range(COMPLETIONS_PER_SUBMISSION)
-            ]
-            completions = make_completions(diverse_starts=diverse)
-            req = make_request(hotkey=f"miner_{miner_idx}", completions=completions)
-            resp = batcher.accept_submission(req)
-            assert resp.accepted is True, f"miner_{miner_idx} rejected: {resp.reason}"
-
+        assert batcher.slots[0].finalized is True
         assert batcher.slots[0].settled is True
 
-        # 9th miner should get slot_full
-        diverse_9th = [
-            [900 + i, 901 + i, 902 + i, 903 + i, 904 + i, 905 + i, 906 + i, 907 + i]
-            for i in range(COMPLETIONS_PER_SUBMISSION)
-        ]
-        completions_9th = make_completions(diverse_starts=diverse_9th)
-        req_9th = make_request(hotkey="miner_extra", completions=completions_9th)
-        resp = batcher.accept_submission(req_9th)
+        # Another miner with totally fresh prefixes still rejected.
+        extra_miner_offset = 2 * BATCHES_PER_CLASS + 5
+        resp = batcher.accept_submission(
+            make_request(
+                hotkey=f"miner_{extra_miner_offset}",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(extra_miner_offset),
+                    correct_flags=[True] * COMPLETIONS_PER_SUBMISSION,
+                ),
+            )
+        )
         assert resp.accepted is False
         assert resp.reason == "slot_full"
+
+    def test_quota_full_same_class_rejected(self) -> None:
+        """Fill class-1 quota, another same-class batch → quota_full.
+        Class-0 is still accepting so wrong submissions continue to be accepted."""
+        batcher = make_batcher()
+        # Fill class 1.0 (corrects) to 64 — 16 miners × 4 corrects.
+        fill_slot_class(batcher, 0, correct=True, start_miner_idx=0, batch_count=BATCHES_PER_CLASS)
+        assert batcher.slots[0].quota_remaining(1.0) == 0
+        assert batcher.slots[0].quota_remaining(0.0) == COMPLETIONS_PER_CLASS
+
+        # 17th miner tries to submit 4 more corrects → quota_full.
+        rejected = batcher.accept_submission(
+            make_request(
+                hotkey="miner_extra_correct",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(BATCHES_PER_CLASS + 1),
+                    correct_flags=[True] * COMPLETIONS_PER_SUBMISSION,
+                ),
+            )
+        )
+        assert rejected.accepted is False
+        assert rejected.reason == "quota_full"
+
+        # A wrong-submitting miner still passes.
+        accepted = batcher.accept_submission(
+            make_request(
+                hotkey="miner_fresh_wrong",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(BATCHES_PER_CLASS + 2),
+                    correct_flags=[False] * COMPLETIONS_PER_SUBMISSION,
+                ),
+            )
+        )
+        assert accepted.accepted is True
 
     def test_prompt_mismatch_rejected(self) -> None:
         batcher = make_batcher()
@@ -455,57 +543,33 @@ class TestRejectionCases:
 
 class TestWindowState:
     def test_is_window_complete_only_when_all_slots_settled(self) -> None:
-        """Settle 7 slots → False; settle 8th → True."""
+        """Fully fill 7 slots (both quotas) → False; fill the 8th → True.
+
+        Note: to limit test cost we fill slots via a per-slot miner-index
+        offset. `fill_slot_class` with the same `start_miner_idx` in
+        different slots is fine because the miner_hotkey namespace is
+        shared but the (hotkey, slot) tuple is what's deduped.
+        Use a fresh start_miner_idx per slot to keep hotkeys unique.
+        """
         batcher = make_batcher()
         assert batcher.is_window_complete() is False
 
-        # Settle slots 0..6 by filling them with GROUP_SIZE completions each.
         for slot_idx in range(PROMPTS_PER_WINDOW - 1):
-            for miner_idx in range(GROUP_SIZE // COMPLETIONS_PER_SUBMISSION):
-                diverse = [
-                    [slot_idx * 1000 + miner_idx * 10 + i,
-                     slot_idx * 1000 + miner_idx * 10 + i + 1,
-                     slot_idx * 1000 + miner_idx * 10 + i + 2,
-                     slot_idx * 1000 + miner_idx * 10 + i + 3,
-                     slot_idx * 1000 + miner_idx * 10 + i + 4,
-                     slot_idx * 1000 + miner_idx * 10 + i + 5,
-                     slot_idx * 1000 + miner_idx * 10 + i + 6,
-                     slot_idx * 1000 + miner_idx * 10 + i + 7]
-                    for i in range(COMPLETIONS_PER_SUBMISSION)
-                ]
-                completions = make_completions(diverse_starts=diverse)
-                req = make_request(
-                    hotkey=f"miner_{slot_idx}_{miner_idx}",
-                    slot_index=slot_idx,
-                    completions=completions,
-                )
-                resp = batcher.accept_submission(req)
-                assert resp.accepted is True
+            base = slot_idx * 2 * BATCHES_PER_CLASS  # leave room for both quotas
+            fill_slot_class(batcher, slot_idx, correct=True,
+                            start_miner_idx=base, batch_count=BATCHES_PER_CLASS)
+            fill_slot_class(batcher, slot_idx, correct=False,
+                            start_miner_idx=base + BATCHES_PER_CLASS, batch_count=BATCHES_PER_CLASS)
 
         assert batcher.is_window_complete() is False
 
-        # Settle last slot (7).
-        last_slot = PROMPTS_PER_WINDOW - 1
-        for miner_idx in range(GROUP_SIZE // COMPLETIONS_PER_SUBMISSION):
-            diverse = [
-                [8000 + miner_idx * 10 + i,
-                 8000 + miner_idx * 10 + i + 1,
-                 8000 + miner_idx * 10 + i + 2,
-                 8000 + miner_idx * 10 + i + 3,
-                 8000 + miner_idx * 10 + i + 4,
-                 8000 + miner_idx * 10 + i + 5,
-                 8000 + miner_idx * 10 + i + 6,
-                 8000 + miner_idx * 10 + i + 7]
-                for i in range(COMPLETIONS_PER_SUBMISSION)
-            ]
-            completions = make_completions(diverse_starts=diverse)
-            req = make_request(
-                hotkey=f"miner_last_{miner_idx}",
-                slot_index=last_slot,
-                completions=completions,
-            )
-            resp = batcher.accept_submission(req)
-            assert resp.accepted is True
+        # Fill the last slot.
+        last = PROMPTS_PER_WINDOW - 1
+        base = last * 2 * BATCHES_PER_CLASS
+        fill_slot_class(batcher, last, correct=True,
+                        start_miner_idx=base, batch_count=BATCHES_PER_CLASS)
+        fill_slot_class(batcher, last, correct=False,
+                        start_miner_idx=base + BATCHES_PER_CLASS, batch_count=BATCHES_PER_CLASS)
 
         assert batcher.is_window_complete() is True
 
@@ -531,128 +595,190 @@ class TestWindowState:
     def test_is_slot_settled(self) -> None:
         batcher = make_batcher()
         assert batcher.is_slot_settled(0) is False
-
-        # Fill it.
-        for miner_idx in range(GROUP_SIZE // COMPLETIONS_PER_SUBMISSION):
-            diverse = [
-                [miner_idx * 50 + i, miner_idx * 50 + i + 1,
-                 miner_idx * 50 + i + 2, miner_idx * 50 + i + 3,
-                 miner_idx * 50 + i + 4, miner_idx * 50 + i + 5,
-                 miner_idx * 50 + i + 6, miner_idx * 50 + i + 7]
-                for i in range(COMPLETIONS_PER_SUBMISSION)
-            ]
-            completions = make_completions(diverse_starts=diverse)
-            req = make_request(hotkey=f"m_{miner_idx}", completions=completions)
-            batcher.accept_submission(req)
-
+        fully_fill_slot(batcher, slot_index=0)
         assert batcher.is_slot_settled(0) is True
 
 
-def _diverse_set(offset: int) -> list[list[int]]:
-    """Build 4 distinct prefixes, offset to avoid collisions across miners."""
-    base = offset * 1000
-    return [
-        [base + i * 10 + j for j in range(8)]
-        for i in range(COMPLETIONS_PER_SUBMISSION)
-    ]
-
-
 class TestAdvantageScoring:
-    def test_balanced_slot_pays_uniformly(self) -> None:
-        """Slot with 16 correct + 16 wrong (4 miners × 4 completions each).
-        mean=0.5, pop_std=0.5, |advantage| of every completion = 1.0 →
-        each miner score = 4.0 (sum across their 4 completions).
-        """
-        batcher = make_batcher()
-        for miner_idx in range(4):
-            correct = miner_idx < 2  # first 2 miners produce 4 corrects, next 2 produce 4 wrongs
-            req = make_request(
-                hotkey=f"miner_{miner_idx}",
-                completions=make_completions(
-                    diverse_starts=_diverse_set(miner_idx),
-                    correct_flags=[correct] * COMPLETIONS_PER_SUBMISSION,
-                ),
-            )
-            assert batcher.accept_submission(req).accepted is True
+    """Advantage math applied to the KEPT subset (post-finalize)."""
 
+    def test_auto_finalize_on_both_quotas_full(self) -> None:
+        """Fill both class quotas (64/64) → auto-finalize → 128 kept, |adv|=1.0 each."""
+        batcher = make_batcher()
+        fully_fill_slot(batcher, slot_index=0)
+        assert batcher.slots[0].finalized is True
+
+        # Every accepted completion is kept (balanced already at accept time).
+        kept_count = sum(1 for c in batcher.slots[0].accepted_completions if c.kept)
+        assert kept_count == GROUP_SIZE
+
+        # Each kept completion contributes |adv|=1.0 → each miner scores 4.0 per batch.
         scores = batcher.get_miner_scores()
-        # 8 corrects + 8 wrongs → mean=0.5, pop_std=0.5, |adv|=1.0 each
-        for miner_idx in range(4):
+        for miner_idx in range(2 * BATCHES_PER_CLASS):
             assert scores[f"miner_{miner_idx}"] == pytest.approx(
                 COMPLETIONS_PER_SUBMISSION * 1.0
             )
 
-    def test_skewed_slot_rewards_rare_class_more(self) -> None:
-        """Slot with 12 correct + 4 wrong → wrong miners earn way more per completion."""
-        batcher = make_batcher()
-        # 3 miners × 4 corrects = 12
+    def test_imbalanced_slot_timeout_keeps_first_come_balanced_subset(self) -> None:
+        """3 batches correct + 1 batch wrong accepted → timeout → 4+4 kept.
+
+        With only 4 wrongs accepted, kept_per_class = min(12, 4) = 4. The
+        first 4 corrects (arrival order) are kept; the other 8 corrects
+        contribute 0. The wrong-submitting miner's 4 wrongs are all kept.
+        """
+        clock = _FakeClock()
+        batcher = make_batcher(time_fn=clock)
+
+        # 3 miners × 4 corrects = 12 corrects, in arrival order.
         for m in range(3):
             req = make_request(
                 hotkey=f"correct_{m}",
                 completions=make_completions(
                     diverse_starts=_diverse_set(m),
-                    correct_flags=[True] * COMPLETIONS_PER_SUBMISSION,
+                    correct_flags=[True] * 4,
                 ),
             )
+            clock.advance(0.1)  # stagger arrivals
             assert batcher.accept_submission(req).accepted is True
-        # 1 miner × 4 wrongs
-        req = make_request(
-            hotkey="wrong_X",
-            completions=make_completions(
-                diverse_starts=_diverse_set(99),
-                correct_flags=[False] * COMPLETIONS_PER_SUBMISSION,
-            ),
-        )
-        assert batcher.accept_submission(req).accepted is True
 
-        # Slot: 12 ones + 4 zeros, n=16
-        # mean = 12/16 = 0.75, var = 12*(0.25)^2/16 + 4*(0.75)^2/16
-        #      = (12*0.0625 + 4*0.5625) / 16 = (0.75 + 2.25) / 16 = 0.1875
-        # pop_std ≈ 0.4330
-        # |adv| of correct = 0.25 / 0.4330 ≈ 0.5774
-        # |adv| of wrong   = 0.75 / 0.4330 ≈ 1.7321
+        # 1 miner × 4 wrongs.
+        clock.advance(0.1)
+        assert batcher.accept_submission(
+            make_request(
+                hotkey="wrong_X",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(99),
+                    correct_flags=[False] * 4,
+                ),
+            )
+        ).accepted is True
+
+        # Fast-forward past the slot deadline and finalize.
+        clock.advance(SLOT_DEADLINE_SECONDS + 1)
+        assert batcher.finalize_due_slots() > 0
+        assert batcher.slots[0].finalized is True
+
+        kept = [c for c in batcher.slots[0].accepted_completions if c.kept]
+        assert len(kept) == 8  # 4 corrects + 4 wrongs
+
+        # correct_0 arrived first → all 4 kept; correct_1 arrived next → 0 kept
+        # (only 4 correct slots available total, all taken by correct_0);
+        # correct_2 → 0 kept.
         scores = batcher.get_miner_scores()
-        for m in range(3):
-            assert scores[f"correct_{m}"] == pytest.approx(4 * 0.5774, abs=1e-3)
-        assert scores["wrong_X"] == pytest.approx(4 * 1.7321, abs=1e-3)
-        # Sanity: the rare-class miner earned roughly 3× per completion.
-        assert scores["wrong_X"] / scores["correct_0"] == pytest.approx(3.0, abs=0.01)
+        assert scores["correct_0"] == pytest.approx(4.0)
+        assert "correct_1" not in scores or scores["correct_1"] == 0
+        assert "correct_2" not in scores or scores["correct_2"] == 0
+        assert scores["wrong_X"] == pytest.approx(4.0)
 
-    def test_degenerate_slot_pays_zero(self) -> None:
-        """All 8 completions correct → std=0 → all scores 0."""
-        batcher = make_batcher()
+    def test_degenerate_slot_kept_empty(self) -> None:
+        """Only one class present → timeout → 0 kept → all miners score 0."""
+        clock = _FakeClock()
+        batcher = make_batcher(time_fn=clock)
+
+        # Submit only corrects, no wrongs at all.
         for m in range(2):
             req = make_request(
                 hotkey=f"miner_{m}",
                 completions=make_completions(
                     diverse_starts=_diverse_set(m),
-                    correct_flags=[True] * COMPLETIONS_PER_SUBMISSION,
+                    correct_flags=[True] * 4,
                 ),
             )
             assert batcher.accept_submission(req).accepted is True
 
+        # Finalize on timeout.
+        clock.advance(SLOT_DEADLINE_SECONDS + 1)
+        batcher.finalize_due_slots()
+        assert batcher.slots[0].finalized is True
+
+        # No kept (dégénéré) — no scores credited.
+        kept_count = sum(1 for c in batcher.slots[0].accepted_completions if c.kept)
+        assert kept_count == 0
         scores = batcher.get_miner_scores()
-        # Both miners present in the dict OR absent — either way zero.
         assert scores.get("miner_0", 0.0) == 0.0
         assert scores.get("miner_1", 0.0) == 0.0
 
     def test_singleton_slot_pays_zero(self) -> None:
-        """A slot is paid only if it has >= 2 completions; we hack the slot directly
-        because the protocol forces submissions in batches of 4. Just call the helper."""
+        """A slot with a single kept completion → std undefined → score 0."""
         from grail.validator.batcher import _compute_slot_scores, AcceptedCompletion, ProblemSlot
 
         slot = ProblemSlot(slot_index=0, prompt_id="p", problem={})
         slot.accepted_completions.append(
             AcceptedCompletion(
-                miner_hotkey="solo", tokens=[1], commit={}, reward=1.0, completion_text="x"
+                miner_hotkey="solo", tokens=[1], commit={}, reward=1.0,
+                completion_text="x", kept=True,
             )
         )
         assert _compute_slot_scores(slot) == {}
 
-    def test_scores_sum_across_slots(self) -> None:
-        """A miner contributing to multiple slots: scores accumulate."""
+    def test_finalize_due_slots_noop_before_deadline(self) -> None:
+        clock = _FakeClock()
+        batcher = make_batcher(time_fn=clock)
+        assert batcher.finalize_due_slots() == 0
+        clock.advance(SLOT_DEADLINE_SECONDS - 1)
+        assert batcher.finalize_due_slots() == 0
+        assert all(not s.finalized for s in batcher.slots)
+
+    def test_finalize_due_slots_marks_all_remaining_slots(self) -> None:
+        """Past the deadline, every unfinalized slot finalises on one call."""
+        clock = _FakeClock()
+        batcher = make_batcher(time_fn=clock)
+        clock.advance(SLOT_DEADLINE_SECONDS + 1)
+        changed = batcher.finalize_due_slots()
+        assert changed == PROMPTS_PER_WINDOW
+        assert all(s.finalized for s in batcher.slots)
+        # Idempotent: a second call does nothing.
+        assert batcher.finalize_due_slots() == 0
+
+    def test_get_burn_count_full_window_budget(self) -> None:
+        """Empty batcher → burn = full window budget (1024 seats)."""
         batcher = make_batcher()
-        # Slot 0: balanced, miner_A contributes 4 corrects (|adv|=1 each)
+        expected = PROMPTS_PER_WINDOW * GROUP_SIZE
+        assert batcher.get_burn_count() == expected
+
+    def test_get_burn_count_after_full_settle(self) -> None:
+        """Fill one slot (128 kept) → burn decreases by 128."""
+        batcher = make_batcher()
+        fully_fill_slot(batcher, slot_index=0)
+        expected = PROMPTS_PER_WINDOW * GROUP_SIZE - GROUP_SIZE
+        assert batcher.get_burn_count() == expected
+
+    def test_get_burn_count_partial_kept(self) -> None:
+        """Imbalanced slot timeout → only 8 kept → burn = 1024 - 8."""
+        clock = _FakeClock()
+        batcher = make_batcher(time_fn=clock)
+        for m in range(3):
+            batcher.accept_submission(
+                make_request(
+                    hotkey=f"correct_{m}",
+                    completions=make_completions(
+                        diverse_starts=_diverse_set(m),
+                        correct_flags=[True] * 4,
+                    ),
+                )
+            )
+        batcher.accept_submission(
+            make_request(
+                hotkey="wrong_X",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(99),
+                    correct_flags=[False] * 4,
+                ),
+            )
+        )
+        clock.advance(SLOT_DEADLINE_SECONDS + 1)
+        batcher.finalize_due_slots()
+        # 4 corrects + 4 wrongs kept from slot 0; other 7 slots empty.
+        kept = 8
+        assert batcher.get_burn_count() == PROMPTS_PER_WINDOW * GROUP_SIZE - kept
+
+    def test_scores_sum_across_slots(self) -> None:
+        """A miner contributing kept completions to multiple slots accumulates scores."""
+        clock = _FakeClock()
+        batcher = make_batcher(time_fn=clock)
+
+        # Slot 0: miner_A (4 correct) + miner_B (4 wrong) → balanced, auto-finalize
+        # won't trigger (only 8 accepted, quotas are 64); need timeout.
         batcher.accept_submission(
             make_request(
                 hotkey="miner_A",
@@ -671,7 +797,7 @@ class TestAdvantageScoring:
                 ),
             )
         )
-        # Slot 1: balanced, miner_A contributes 4 wrongs
+        # Slot 1: miner_A (4 wrong) + miner_C (4 correct)
         batcher.accept_submission(
             make_request(
                 hotkey="miner_A",
@@ -691,11 +817,13 @@ class TestAdvantageScoring:
             )
         )
 
+        # Fast-forward and finalize.
+        clock.advance(SLOT_DEADLINE_SECONDS + 1)
+        batcher.finalize_due_slots()
+
+        # Each slot has 4+4=8 kept (balanced) → |adv|=1.0 each.
+        # miner_A contributes 4 kept to slot 0 + 4 kept to slot 1 = 8
         scores = batcher.get_miner_scores()
-        # Each balanced slot pays |adv|=1 per completion.
-        # miner_A is in slot 0 (4 corrects, |adv|=1) and slot 1 (4 wrongs, |adv|=1) → 8
-        # miner_B only in slot 0 → 4
-        # miner_C only in slot 1 → 4
         assert scores["miner_A"] == pytest.approx(8.0)
         assert scores["miner_B"] == pytest.approx(4.0)
         assert scores["miner_C"] == pytest.approx(4.0)

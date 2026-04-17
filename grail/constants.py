@@ -82,8 +82,16 @@ MAX_TOKENS_PER_ROLLOUT = MAX_NEW_TOKENS_PROTOCOL_CAP + 4096
 # Number of distinct prompts to derive per window from the beacon.
 PROMPTS_PER_WINDOW = 8
 
-# Completions per (prompt) needed to settle a slot — the GRPO group size.
-GROUP_SIZE = 32
+# Completions per prompt to collect at the slot cap — 64 per reward class
+# × 2 classes. Balanced 50/50 composition is the information-theoretic
+# optimum for binary-reward GRPO.
+GROUP_SIZE = 128
+
+# Per-reward-class quota inside a slot. Once a class has `COMPLETIONS_PER_CLASS`
+# accepted completions, new submissions with that reward value are rejected
+# ("quota_full"). This guarantees that a slot can never reach a dégénéré
+# (all-one-class) settlement.
+COMPLETIONS_PER_CLASS = 64
 
 # Completions a miner submits in one HTTP call (also = max per miner per prompt).
 COMPLETIONS_PER_SUBMISSION = 4
@@ -96,6 +104,13 @@ VALIDATOR_HTTP_PORT = 8888
 
 # Active environment name (resolved by grail.environment.load_environment).
 ENVIRONMENT_NAME = "gsm8k"
+
+# Per-slot collection deadline from window start. Slots finalize as soon as
+# both class quotas are full OR this timeout is reached, whichever comes first.
+SLOT_DEADLINE_SECONDS = 60
+
+# UID that receives unused slot emission budget (the burn address).
+UID_BURN = 0
 
 # ────────────────  ECONOMIC / INCENTIVE  ────────────────
 
