@@ -115,12 +115,14 @@ _DIVERSE_STARTS = [
 ]
 
 # Tail tokens that decode to contain "42": chr(52)='4', chr(50)='2'
-_REWARD_TAIL = [52, 50]  # decodes to "42"
+_REWARD_TAIL = [52, 50]  # decodes to "42" → reward 1.0 from FakeEnv
+_WRONG_TAIL = [33]        # decodes to "!" → no "42" substring → reward 0.0
 
 
-def make_tokens(diverse_idx: int) -> list[int]:
-    """Build a full token list: [prompt] + [diverse_prefix_8] + [reward_tail]."""
-    return PROMPT_TOKENS + _DIVERSE_STARTS[diverse_idx] + _REWARD_TAIL
+def make_tokens(diverse_idx: int, correct: bool = True) -> list[int]:
+    """Build a full token list: [prompt] + [diverse_prefix_8] + [tail]."""
+    tail = _REWARD_TAIL if correct else _WRONG_TAIL
+    return PROMPT_TOKENS + _DIVERSE_STARTS[diverse_idx] + tail
 
 
 def make_commit(tokens: list[int], prompt_length: int = PROMPT_LEN) -> dict:
@@ -136,13 +138,21 @@ def make_commit(tokens: list[int], prompt_length: int = PROMPT_LEN) -> dict:
 def make_completions(
     diverse_starts: list[list[int]] | None = None,
     prompt_length: int = PROMPT_LEN,
+    correct_flags: list[bool] | None = None,
 ) -> list[CompletionSubmission]:
-    """Build 4 CompletionSubmission objects with distinct prefixes."""
+    """Build 4 CompletionSubmission objects with distinct prefixes.
+
+    ``correct_flags`` controls per-completion reward: True → reward=1.0,
+    False → reward=0.0. Default is all-correct (legacy behaviour).
+    """
     if diverse_starts is None:
         diverse_starts = _DIVERSE_STARTS
+    if correct_flags is None:
+        correct_flags = [True] * COMPLETIONS_PER_SUBMISSION
     result = []
     for i in range(COMPLETIONS_PER_SUBMISSION):
-        tokens = PROMPT_TOKENS + diverse_starts[i] + _REWARD_TAIL
+        tail = _REWARD_TAIL if correct_flags[i] else _WRONG_TAIL
+        tokens = PROMPT_TOKENS + diverse_starts[i] + tail
         commit = make_commit(tokens, prompt_length)
         result.append(CompletionSubmission(tokens=tokens, commit=commit))
     return result
@@ -538,28 +548,200 @@ class TestWindowState:
         assert batcher.is_slot_settled(0) is True
 
 
-class TestScoresAndArchive:
-    def test_get_miner_scores_sums_rewards(self) -> None:
-        """Scores are summed across all accepted completions."""
+def _diverse_set(offset: int) -> list[list[int]]:
+    """Build 4 distinct prefixes, offset to avoid collisions across miners."""
+    base = offset * 1000
+    return [
+        [base + i * 10 + j for j in range(8)]
+        for i in range(COMPLETIONS_PER_SUBMISSION)
+    ]
+
+
+class TestAdvantageScoring:
+    def test_balanced_slot_pays_uniformly(self) -> None:
+        """Slot with 16 correct + 16 wrong (4 miners × 4 completions each).
+        mean=0.5, pop_std=0.5, |advantage| of every completion = 1.0 →
+        each miner score = 4.0 (sum across their 4 completions).
+        """
         batcher = make_batcher()
+        for miner_idx in range(4):
+            correct = miner_idx < 2  # first 2 miners produce 4 corrects, next 2 produce 4 wrongs
+            req = make_request(
+                hotkey=f"miner_{miner_idx}",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(miner_idx),
+                    correct_flags=[correct] * COMPLETIONS_PER_SUBMISSION,
+                ),
+            )
+            assert batcher.accept_submission(req).accepted is True
 
-        # miner_A submits to slot 0 (4 completions, reward=1.0 each → total=4.0)
-        batcher.accept_submission(make_request(hotkey="miner_A", slot_index=0))
+        scores = batcher.get_miner_scores()
+        # 8 corrects + 8 wrongs → mean=0.5, pop_std=0.5, |adv|=1.0 each
+        for miner_idx in range(4):
+            assert scores[f"miner_{miner_idx}"] == pytest.approx(
+                COMPLETIONS_PER_SUBMISSION * 1.0
+            )
 
-        # miner_B submits to slot 0 (different diverse prefixes)
-        diverse_B = [
-            [500 + i, 501 + i, 502 + i, 503 + i, 504 + i, 505 + i, 506 + i, 507 + i]
-            for i in range(COMPLETIONS_PER_SUBMISSION)
-        ]
-        completions_B = make_completions(diverse_starts=diverse_B)
+    def test_skewed_slot_rewards_rare_class_more(self) -> None:
+        """Slot with 12 correct + 4 wrong → wrong miners earn way more per completion."""
+        batcher = make_batcher()
+        # 3 miners × 4 corrects = 12
+        for m in range(3):
+            req = make_request(
+                hotkey=f"correct_{m}",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(m),
+                    correct_flags=[True] * COMPLETIONS_PER_SUBMISSION,
+                ),
+            )
+            assert batcher.accept_submission(req).accepted is True
+        # 1 miner × 4 wrongs
+        req = make_request(
+            hotkey="wrong_X",
+            completions=make_completions(
+                diverse_starts=_diverse_set(99),
+                correct_flags=[False] * COMPLETIONS_PER_SUBMISSION,
+            ),
+        )
+        assert batcher.accept_submission(req).accepted is True
+
+        # Slot: 12 ones + 4 zeros, n=16
+        # mean = 12/16 = 0.75, var = 12*(0.25)^2/16 + 4*(0.75)^2/16
+        #      = (12*0.0625 + 4*0.5625) / 16 = (0.75 + 2.25) / 16 = 0.1875
+        # pop_std ≈ 0.4330
+        # |adv| of correct = 0.25 / 0.4330 ≈ 0.5774
+        # |adv| of wrong   = 0.75 / 0.4330 ≈ 1.7321
+        scores = batcher.get_miner_scores()
+        for m in range(3):
+            assert scores[f"correct_{m}"] == pytest.approx(4 * 0.5774, abs=1e-3)
+        assert scores["wrong_X"] == pytest.approx(4 * 1.7321, abs=1e-3)
+        # Sanity: the rare-class miner earned roughly 3× per completion.
+        assert scores["wrong_X"] / scores["correct_0"] == pytest.approx(3.0, abs=0.01)
+
+    def test_degenerate_slot_pays_zero(self) -> None:
+        """All 8 completions correct → std=0 → all scores 0."""
+        batcher = make_batcher()
+        for m in range(2):
+            req = make_request(
+                hotkey=f"miner_{m}",
+                completions=make_completions(
+                    diverse_starts=_diverse_set(m),
+                    correct_flags=[True] * COMPLETIONS_PER_SUBMISSION,
+                ),
+            )
+            assert batcher.accept_submission(req).accepted is True
+
+        scores = batcher.get_miner_scores()
+        # Both miners present in the dict OR absent — either way zero.
+        assert scores.get("miner_0", 0.0) == 0.0
+        assert scores.get("miner_1", 0.0) == 0.0
+
+    def test_singleton_slot_pays_zero(self) -> None:
+        """A slot is paid only if it has >= 2 completions; we hack the slot directly
+        because the protocol forces submissions in batches of 4. Just call the helper."""
+        from grail.validator.batcher import _compute_slot_scores, AcceptedCompletion, ProblemSlot
+
+        slot = ProblemSlot(slot_index=0, prompt_id="p", problem={})
+        slot.accepted_completions.append(
+            AcceptedCompletion(
+                miner_hotkey="solo", tokens=[1], commit={}, reward=1.0, completion_text="x"
+            )
+        )
+        assert _compute_slot_scores(slot) == {}
+
+    def test_scores_sum_across_slots(self) -> None:
+        """A miner contributing to multiple slots: scores accumulate."""
+        batcher = make_batcher()
+        # Slot 0: balanced, miner_A contributes 4 corrects (|adv|=1 each)
         batcher.accept_submission(
-            make_request(hotkey="miner_B", slot_index=0, completions=completions_B)
+            make_request(
+                hotkey="miner_A",
+                slot_index=0,
+                completions=make_completions(
+                    diverse_starts=_diverse_set(0), correct_flags=[True] * 4
+                ),
+            )
+        )
+        batcher.accept_submission(
+            make_request(
+                hotkey="miner_B",
+                slot_index=0,
+                completions=make_completions(
+                    diverse_starts=_diverse_set(1), correct_flags=[False] * 4
+                ),
+            )
+        )
+        # Slot 1: balanced, miner_A contributes 4 wrongs
+        batcher.accept_submission(
+            make_request(
+                hotkey="miner_A",
+                slot_index=1,
+                completions=make_completions(
+                    diverse_starts=_diverse_set(0), correct_flags=[False] * 4
+                ),
+            )
+        )
+        batcher.accept_submission(
+            make_request(
+                hotkey="miner_C",
+                slot_index=1,
+                completions=make_completions(
+                    diverse_starts=_diverse_set(1), correct_flags=[True] * 4
+                ),
+            )
         )
 
         scores = batcher.get_miner_scores()
-        assert scores["miner_A"] == pytest.approx(4.0)
+        # Each balanced slot pays |adv|=1 per completion.
+        # miner_A is in slot 0 (4 corrects, |adv|=1) and slot 1 (4 wrongs, |adv|=1) → 8
+        # miner_B only in slot 0 → 4
+        # miner_C only in slot 1 → 4
+        assert scores["miner_A"] == pytest.approx(8.0)
         assert scores["miner_B"] == pytest.approx(4.0)
+        assert scores["miner_C"] == pytest.approx(4.0)
 
+
+class TestRewardHistogramExposed:
+    def test_window_state_includes_reward_histogram(self) -> None:
+        batcher = make_batcher()
+        # 1 miner × 4 corrects, 1 miner × 4 wrongs in slot 0.
+        batcher.accept_submission(
+            make_request(
+                hotkey="miner_A",
+                slot_index=0,
+                completions=make_completions(
+                    diverse_starts=_diverse_set(0), correct_flags=[True] * 4
+                ),
+            )
+        )
+        batcher.accept_submission(
+            make_request(
+                hotkey="miner_B",
+                slot_index=0,
+                completions=make_completions(
+                    diverse_starts=_diverse_set(1), correct_flags=[False] * 4
+                ),
+            )
+        )
+
+        state = batcher.get_window_state()
+        slot0 = next(s for s in state.slot_states if s.slot_index == 0)
+        assert slot0.rewards == {"1.0": 4, "0.0": 4}
+
+        # Empty slots have empty histogram (default).
+        slot1 = next(s for s in state.slot_states if s.slot_index == 1)
+        assert slot1.rewards == {}
+
+    def test_histogram_omits_unseen_reward_values(self) -> None:
+        """Slot with 4 corrects, 0 wrongs → histogram has only {"1.0": 4}."""
+        batcher = make_batcher()
+        batcher.accept_submission(make_request(hotkey="miner_A", slot_index=0))
+        state = batcher.get_window_state()
+        slot0 = next(s for s in state.slot_states if s.slot_index == 0)
+        assert slot0.rewards == {"1.0": 4}
+
+
+class TestScoresAndArchive:
     def test_get_archive_data_shape(self) -> None:
         """Archive data has correct top-level keys; empty slots are skipped."""
         batcher = make_batcher()

@@ -130,10 +130,27 @@ class TestSlotStateAndWindowState:
     def test_slot_state_valid(self) -> None:
         s = SlotState(slot_index=2, prompt_id="abc", count=12, settled=False)
         assert s.count == 12
+        assert s.rewards == {}  # default empty histogram
+
+    def test_slot_state_with_rewards_histogram(self) -> None:
+        s = SlotState(
+            slot_index=0,
+            prompt_id="p0",
+            count=28,
+            settled=False,
+            rewards={"1.0": 28, "0.0": 0},
+        )
+        assert s.rewards["1.0"] == 28
 
     def test_window_state_response_roundtrip(self) -> None:
         slots = [
-            SlotState(slot_index=i, prompt_id=f"p{i}", count=i * 4, settled=(i == 0))
+            SlotState(
+                slot_index=i,
+                prompt_id=f"p{i}",
+                count=i * 4,
+                settled=(i == 0),
+                rewards={"1.0": i * 2, "0.0": i * 2},
+            )
             for i in range(PROMPTS_PER_WINDOW)
         ]
         w = WindowStateResponse(window_start=2000, slot_states=slots)
@@ -141,3 +158,4 @@ class TestSlotStateAndWindowState:
         restored = WindowStateResponse.model_validate_json(payload)
         assert restored == w
         assert len(restored.slot_states) == PROMPTS_PER_WINDOW
+        assert restored.slot_states[2].rewards == {"1.0": 4, "0.0": 4}

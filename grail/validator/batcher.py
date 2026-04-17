@@ -29,7 +29,52 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Module-level helper (tested independently in tests/unit/test_diversity.py)
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_slot_scores(slot: "ProblemSlot") -> dict[str, float]:
+    """Per-miner advantage contribution within a single slot.
+
+    Score per accepted completion = ``|reward - mean| / std`` (population
+    std). Sums per miner_hotkey. Returns empty dict for degenerate slots
+    (fewer than 2 completions or zero variance) — they carry no GRPO signal.
+    """
+    completions = slot.accepted_completions
+    if len(completions) < 2:
+        return {}
+
+    rewards = [c.reward for c in completions]
+    n = len(rewards)
+    mean = sum(rewards) / n
+    var = sum((r - mean) ** 2 for r in rewards) / n  # population variance
+    if var == 0.0:
+        return {}
+    std = var ** 0.5
+
+    contribs: dict[str, float] = {}
+    for c in completions:
+        adv = abs(c.reward - mean) / std
+        contribs[c.miner_hotkey] = contribs.get(c.miner_hotkey, 0.0) + adv
+    return contribs
+
+
+def _reward_histogram(slot: "ProblemSlot") -> dict[str, int]:
+    """Build {str(reward): count} for the slot's accepted completions.
+
+    Keys are stringified floats (JSON requires string keys). Only reward
+    values that actually appear are included — a slot with 28 corrects and
+    no wrongs returns ``{"1.0": 28}``, not ``{"1.0": 28, "0.0": 0}``.
+    """
+    histogram: dict[str, int] = {}
+    for c in slot.accepted_completions:
+        key = str(c.reward)
+        histogram[key] = histogram.get(key, 0) + 1
+    return histogram
+
+
+# ---------------------------------------------------------------------------
+# Diversity check (tested independently in tests/unit/test_diversity.py)
 # ---------------------------------------------------------------------------
 
 
@@ -328,13 +373,19 @@ class WindowBatcher:
         return all(slot.settled for slot in self.slots)
 
     def get_window_state(self) -> WindowStateResponse:
-        """Return a snapshot of all slot states for the HTTP /window/{n}/state endpoint."""
+        """Return a snapshot of all slot states for the HTTP /window/{n}/state endpoint.
+
+        Each slot includes the histogram of accepted-completion rewards so
+        miners can choose the rare class (the one that will have the largest
+        absolute advantage in the final z-score-based scoring).
+        """
         slot_states = [
             SlotState(
                 slot_index=slot.slot_index,
                 prompt_id=slot.prompt_id,
                 count=slot.count,
                 settled=slot.settled,
+                rewards=_reward_histogram(slot),
             )
             for slot in self.slots
         ]
@@ -344,11 +395,21 @@ class WindowBatcher:
         )
 
     def get_miner_scores(self) -> dict[str, float]:
-        """Return ``{hotkey: total_reward}`` summed across all accepted completions."""
+        """Return ``{hotkey: cumulative |z-score| across all accepted completions}``.
+
+        For each slot:
+          * Compute the population mean and stdev of accepted completion rewards.
+          * Each completion's contribution = ``|reward - mean| / std``.
+          * Slots with fewer than 2 completions OR std == 0 contribute zero
+            (no GRPO signal — degenerate slot).
+
+        Sum contributions per miner across all slots.
+        """
         scores: dict[str, float] = {}
         for slot in self.slots:
-            for ac in slot.accepted_completions:
-                scores[ac.miner_hotkey] = scores.get(ac.miner_hotkey, 0.0) + ac.reward
+            slot_contribs = _compute_slot_scores(slot)
+            for hk, contrib in slot_contribs.items():
+                scores[hk] = scores.get(hk, 0.0) + contrib
         return scores
 
     def get_archive_data(self) -> dict:

@@ -66,6 +66,11 @@ class SlotState(BaseModel):
     prompt_id: str
     count: int = Field(..., ge=0)
     settled: bool
+    # Histogram of accepted completion rewards in this slot, e.g.
+    # {"1.0": 28, "0.0": 0}. Lets miners pick the rare class to maximise
+    # their advantage-based score under the slot's final distribution.
+    # Keys are stringified floats because JSON keys must be strings.
+    rewards: dict[str, int] = Field(default_factory=dict)
 
 
 class WindowStateResponse(BaseModel):
