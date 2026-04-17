@@ -44,7 +44,11 @@ PROOF_SKETCH_TOLERANCE_BASE = 6000
 PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 
 # Attention implementation forced across all model loading paths.
-ATTN_IMPLEMENTATION = "flash_attention_2"
+# Override with GRAIL_ATTN_IMPL for test envs without flash-attn compiled
+# (e.g. "eager" or "sdpa"). Production runs must stay on flash_attention_2
+# because sketch commitments are bit-sensitive to attention kernel variance.
+import os as _os
+ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
 
