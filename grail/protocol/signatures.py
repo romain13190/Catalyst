@@ -73,7 +73,7 @@ def sign_commit_binding(
     model_name: str,
     layer_index: int,
     commitments: list[dict],
-    wallet: bt.wallet,  # type: ignore[misc]
+    wallet: bt.Wallet,  # type: ignore[misc]
 ) -> bytes:
     """Sign the commit-binding message with wallet hotkey."""
     if bt is None:

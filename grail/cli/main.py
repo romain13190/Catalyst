@@ -59,7 +59,7 @@ def mine(
         from grail.infrastructure.chain import get_subtensor
         from grail.miner.engine import MiningEngine
 
-        wallet = bt.wallet(name=wallet_name, hotkey=hotkey)
+        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey)
         subtensor = await get_subtensor()
 
         logger.info("Loading models from %s...", checkpoint)
@@ -145,7 +145,7 @@ def validate(
         from grail.infrastructure.chain import get_subtensor
         from grail.validator.service import ValidationService
 
-        wallet = bt.wallet(name=wallet_name, hotkey=hotkey)
+        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey)
         subtensor = await get_subtensor()
 
         logger.info("Loading model from %s...", checkpoint)
